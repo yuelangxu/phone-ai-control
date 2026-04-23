@@ -19,13 +19,16 @@ The app shows whether the local API is online, shows the current public tunnel U
 - Stops the public tunnel.
 - Stops both the public tunnel and API.
 - Copies the current public address.
-- Does not display or store the API token.
+- Can copy the API token on demand and automatically clear it from clipboard after 20 seconds.
+- Does not display the API token in the UI and does not store it in shared storage.
 
 ## Security Model
 
 This app is only a control panel. It does not contain a backend server, API token, public URL, phone serial number, or device-specific identifier.
 
 The sensitive work is delegated to Termux through Termux's official `RunCommandService`. Termux must explicitly allow external app commands before this app can control scripts.
+
+The token is still owned by the Termux-side API because the Termux process validates incoming bearer tokens. This app requests the token only when the user presses `Copy Token (20s)`, copies it to clipboard, and then clears the clipboard after a short timeout.
 
 Required Termux property:
 

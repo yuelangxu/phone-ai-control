@@ -1,7 +1,7 @@
 package com.example.phoneaicontrol;
 
-import android.Manifest;
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -29,10 +29,17 @@ import java.net.URL;
 
 public class MainActivity extends Activity {
     private static final String RUN_COMMAND_PERMISSION = "com.termux.permission.RUN_COMMAND";
+    private static final String RUN_COMMAND_ACTION = "com.termux.RUN_COMMAND";
+    private static final String RUN_COMMAND_PATH_EXTRA = "com.termux.RUN_COMMAND_PATH";
+    private static final String RUN_COMMAND_ARGUMENTS_EXTRA = "com.termux.RUN_COMMAND_ARGUMENTS";
+    private static final String RUN_COMMAND_WORKDIR_EXTRA = "com.termux.RUN_COMMAND_WORKDIR";
+    private static final String RUN_COMMAND_BACKGROUND_EXTRA = "com.termux.RUN_COMMAND_BACKGROUND";
+    private static final String RUN_COMMAND_PENDING_INTENT_EXTRA = "com.termux.RUN_COMMAND_PENDING_INTENT";
     private static final String LOCAL_API = "http://127.0.0.1:8787";
     private static final String TERMUX_HOME = "/data/data/com.termux/files/home";
     private static final String TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash";
     private static final int REQUEST_RUN_COMMAND = 42;
+    private static final int TOKEN_CLEAR_AFTER_MS = 20_000;
 
     private TextView statusText;
     private TextView addressText;
@@ -77,6 +84,7 @@ public class MainActivity extends Activity {
         stopAllButton = button("Stop API And Tunnel");
         Button refreshButton = button("Refresh Status");
         Button copyButton = button("Copy Address");
+        Button copyTokenButton = button("Copy Token (20s)");
         Button settingsButton = button("Open Termux Permission Settings");
 
         startButton.setOnClickListener(new View.OnClickListener() {
@@ -123,6 +131,12 @@ public class MainActivity extends Activity {
                 copyAddress();
             }
         });
+        copyTokenButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyToken();
+            }
+        });
         settingsButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -135,10 +149,11 @@ public class MainActivity extends Activity {
         root.addView(stopAllButton);
         root.addView(refreshButton);
         root.addView(copyButton);
+        root.addView(copyTokenButton);
         root.addView(settingsButton);
 
         TextView note = text(
-                "Security note: this app does not show your API token. It only starts/stops Termux scripts and checks public reachability.",
+                "Security note: the token stays in Termux private storage and is only copied on demand. This app clears copied token text from clipboard after 20 seconds.",
                 13,
                 Color.rgb(96, 96, 96),
                 false);
@@ -276,15 +291,49 @@ public class MainActivity extends Activity {
         try {
             Intent intent = new Intent();
             intent.setClassName("com.termux", "com.termux.app.RunCommandService");
-            intent.setAction("com.termux.RUN_COMMAND");
-            intent.putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_BASH);
-            intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", new String[]{"-lc", command});
-            intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_HOME);
-            intent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
+            intent.setAction(RUN_COMMAND_ACTION);
+            intent.putExtra(RUN_COMMAND_PATH_EXTRA, TERMUX_BASH);
+            intent.putExtra(RUN_COMMAND_ARGUMENTS_EXTRA, new String[]{"-lc", command});
+            intent.putExtra(RUN_COMMAND_WORKDIR_EXTRA, TERMUX_HOME);
+            intent.putExtra(RUN_COMMAND_BACKGROUND_EXTRA, true);
             startService(intent);
             Toast.makeText(this, toast, Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             Toast.makeText(this, "Could not start Termux command: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void copyToken() {
+        if (!hasTermuxPermission()) {
+            requestTermuxPermissionIfNeeded();
+            Toast.makeText(this, "Termux command permission is required.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        try {
+            Intent resultIntent = new Intent(this, TokenResultService.class);
+            int executionId = TokenResultService.getNextExecutionId();
+            resultIntent.putExtra(TokenResultService.EXTRA_EXECUTION_ID, executionId);
+            resultIntent.putExtra(TokenResultService.EXTRA_ACTION_NAME, TokenResultService.ACTION_COPY_TOKEN);
+            resultIntent.putExtra(TokenResultService.EXTRA_CLEAR_AFTER_MS, TOKEN_CLEAR_AFTER_MS);
+            PendingIntent pendingIntent = PendingIntent.getService(
+                    this,
+                    executionId,
+                    resultIntent,
+                    PendingIntent.FLAG_ONE_SHOT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_MUTABLE : 0)
+            );
+
+            Intent intent = new Intent();
+            intent.setClassName("com.termux", "com.termux.app.RunCommandService");
+            intent.setAction(RUN_COMMAND_ACTION);
+            intent.putExtra(RUN_COMMAND_PATH_EXTRA, TERMUX_BASH);
+            intent.putExtra(RUN_COMMAND_ARGUMENTS_EXTRA, new String[]{"-lc", "cat " + TERMUX_HOME + "/ai-phone-api/token.txt"});
+            intent.putExtra(RUN_COMMAND_WORKDIR_EXTRA, TERMUX_HOME);
+            intent.putExtra(RUN_COMMAND_BACKGROUND_EXTRA, true);
+            intent.putExtra(RUN_COMMAND_PENDING_INTENT_EXTRA, pendingIntent);
+            startService(intent);
+            Toast.makeText(this, "Copy Token requested. Clipboard will auto-clear after 20 seconds.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not request token copy: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 

@@ -19,5 +19,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".TokenResultService"
+            android:exported="false" />
+        <receiver
+            android:name=".ClipboardClearReceiver"
+            android:exported="false" />
     </application>
 </manifest>
