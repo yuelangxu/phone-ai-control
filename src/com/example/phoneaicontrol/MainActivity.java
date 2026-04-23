@@ -84,6 +84,7 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 runTermuxCommand(
                         TERMUX_HOME + "/ai-phone-api/start-phone-ai-api.sh; "
+                                + TERMUX_HOME + "/ai-phone-api/start-phone-ai-tunnel.sh || "
                                 + TERMUX_HOME + "/ai-phone-api/start-phone-ai-localtunnel.sh",
                         "Start requested. Refresh again in a few seconds.");
                 delayedRefresh();
@@ -249,6 +250,8 @@ public class MainActivity extends Activity {
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(timeoutMs);
         conn.setReadTimeout(timeoutMs);
+        conn.setRequestProperty("User-Agent", "PhoneAIControl/1.0");
+        conn.setRequestProperty("bypass-tunnel-reminder", "1");
         int code = conn.getResponseCode();
         BufferedReader reader = new BufferedReader(new InputStreamReader(
                 code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream()));
