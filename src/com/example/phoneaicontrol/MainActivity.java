@@ -30,6 +30,8 @@ import java.net.URL;
 public class MainActivity extends Activity {
     private static final String RUN_COMMAND_PERMISSION = "com.termux.permission.RUN_COMMAND";
     private static final String LOCAL_API = "http://127.0.0.1:8787";
+    private static final String TERMUX_HOME = "/data/data/com.termux/files/home";
+    private static final String TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash";
     private static final int REQUEST_RUN_COMMAND = 42;
 
     private TextView statusText;
@@ -81,7 +83,8 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 runTermuxCommand(
-                        "sh ~/ai-phone-api/start-phone-ai-api.sh; sh ~/ai-phone-api/start-phone-ai-localtunnel.sh",
+                        TERMUX_HOME + "/ai-phone-api/start-phone-ai-api.sh; "
+                                + TERMUX_HOME + "/ai-phone-api/start-phone-ai-localtunnel.sh",
                         "Start requested. Refresh again in a few seconds.");
                 delayedRefresh();
             }
@@ -90,7 +93,8 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 runTermuxCommand(
-                        "sh ~/ai-phone-api/stop-phone-ai-localtunnel.sh; sh ~/ai-phone-api/stop-phone-ai-tunnel.sh",
+                        TERMUX_HOME + "/ai-phone-api/stop-phone-ai-localtunnel.sh; "
+                                + TERMUX_HOME + "/ai-phone-api/stop-phone-ai-tunnel.sh",
                         "Public tunnel stop requested.");
                 delayedRefresh();
             }
@@ -99,7 +103,9 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 runTermuxCommand(
-                        "sh ~/ai-phone-api/stop-phone-ai-localtunnel.sh; sh ~/ai-phone-api/stop-phone-ai-tunnel.sh; sh ~/ai-phone-api/stop-phone-ai-api.sh",
+                        TERMUX_HOME + "/ai-phone-api/stop-phone-ai-localtunnel.sh; "
+                                + TERMUX_HOME + "/ai-phone-api/stop-phone-ai-tunnel.sh; "
+                                + TERMUX_HOME + "/ai-phone-api/stop-phone-ai-api.sh",
                         "API and tunnel stop requested.");
                 delayedRefresh();
             }
@@ -193,7 +199,7 @@ public class MainActivity extends Activity {
             try {
                 JSONObject health = getJson(LOCAL_API + "/healthz", 2500);
                 localStatus = health.optBoolean("ok") ? "Online" : "Unexpected response";
-                publicUrl = health.optString("public_url", "");
+                publicUrl = normalizePublicUrl(health.optString("public_url", ""));
                 boolean enabled = health.optBoolean("public_enabled", false);
                 boolean lt = health.optBoolean("localtunnel_running", false);
                 boolean cf = health.optBoolean("cloudflared_running", false);
@@ -209,6 +215,8 @@ public class MainActivity extends Activity {
                         publicStatus = "Enabled (tunnel running)";
                         details += "\npublic self-check: " + e.getClass().getSimpleName() + ": " + e.getMessage();
                     }
+                } else if ((lt || cf) && publicUrl.isEmpty()) {
+                    publicStatus = "Starting tunnel...";
                 } else {
                     publicStatus = "Off";
                 }
@@ -266,9 +274,9 @@ public class MainActivity extends Activity {
             Intent intent = new Intent();
             intent.setClassName("com.termux", "com.termux.app.RunCommandService");
             intent.setAction("com.termux.RUN_COMMAND");
-            intent.putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/sh");
-            intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", new String[]{"-c", command});
-            intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/com.termux/files/home");
+            intent.putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_BASH);
+            intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", new String[]{"-lc", command});
+            intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_HOME);
             intent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
             startService(intent);
             Toast.makeText(this, toast, Toast.LENGTH_LONG).show();
@@ -319,6 +327,17 @@ public class MainActivity extends Activity {
         startButton.setEnabled(enabled);
         stopPublicButton.setEnabled(enabled);
         stopAllButton.setEnabled(enabled);
+    }
+
+    private String normalizePublicUrl(String value) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty() || "null".equalsIgnoreCase(trimmed)) {
+            return "";
+        }
+        return trimmed;
     }
 
     private int dp(int value) {
