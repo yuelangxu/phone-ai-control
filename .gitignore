@@ -1,0 +1,16 @@
+build/
+*.apk
+*.ap_
+*.dex
+*.class
+*.keystore
+*.jks
+local.properties
+.gradle/
+.idea/
+*.iml
+*.log
+token.txt
+tunnel-url.txt
+PHONE_AI_API_README.md
+TERMUX_AI_README.md
