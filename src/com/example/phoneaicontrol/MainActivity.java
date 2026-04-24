@@ -91,11 +91,9 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 runTermuxCommand(
-                        TERMUX_HOME + "/ai-phone-api/start-phone-ai-api.sh; "
-                                + TERMUX_HOME + "/ai-phone-api/start-phone-ai-tunnel.sh || "
-                                + TERMUX_HOME + "/ai-phone-api/start-phone-ai-localtunnel.sh",
+                        TERMUX_HOME + "/ai-phone-api/start-phone-ai-public.sh",
                         "Start requested. Refresh again in a few seconds.");
-                delayedRefresh();
+                scheduleRefreshes(1500, 5000, 12000);
             }
         });
         stopPublicButton.setOnClickListener(new View.OnClickListener() {
@@ -105,18 +103,16 @@ public class MainActivity extends Activity {
                         TERMUX_HOME + "/ai-phone-api/stop-phone-ai-localtunnel.sh; "
                                 + TERMUX_HOME + "/ai-phone-api/stop-phone-ai-tunnel.sh",
                         "Public tunnel stop requested.");
-                delayedRefresh();
+                scheduleRefreshes(1500, 5000, 10000);
             }
         });
         stopAllButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 runTermuxCommand(
-                        TERMUX_HOME + "/ai-phone-api/stop-phone-ai-localtunnel.sh; "
-                                + TERMUX_HOME + "/ai-phone-api/stop-phone-ai-tunnel.sh; "
-                                + TERMUX_HOME + "/ai-phone-api/stop-phone-ai-api.sh",
+                        TERMUX_HOME + "/ai-phone-api/stop-phone-ai-all.sh",
                         "API and tunnel stop requested.");
-                delayedRefresh();
+                scheduleRefreshes(1500, 5000, 10000);
             }
         });
         refreshButton.setOnClickListener(new View.OnClickListener() {
@@ -366,13 +362,15 @@ public class MainActivity extends Activity {
         Toast.makeText(this, "Address copied.", Toast.LENGTH_SHORT).show();
     }
 
-    private void delayedRefresh() {
-        statusText.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                refreshStatus();
-            }
-        }, 6000);
+    private void scheduleRefreshes(long... delaysMs) {
+        for (long delayMs : delaysMs) {
+            statusText.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    refreshStatus();
+                }
+            }, delayMs);
+        }
     }
 
     private void setButtons(boolean enabled) {

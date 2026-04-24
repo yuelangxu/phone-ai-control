@@ -21,6 +21,8 @@ The app shows whether the local API is online, shows the current public tunnel U
 - Copies the current public address.
 - Can copy the API token on demand and automatically clear it from clipboard after 20 seconds.
 - Does not display the API token in the UI and does not store it in shared storage.
+- Uses dedicated Termux wrapper scripts for `Start Public API` and `Stop API And Tunnel`, so the UI no longer depends on a long inline shell command chain.
+- Schedules several follow-up refreshes after start/stop actions, which makes status transitions much less likely to get stuck in a stale intermediate state.
 
 ## Security Model
 
@@ -49,11 +51,10 @@ The app also enables cleartext HTTP only so it can reach the phone's own loopbac
 The app expects these scripts to exist in Termux:
 
 ```text
-~/ai-phone-api/start-phone-ai-api.sh
-~/ai-phone-api/start-phone-ai-localtunnel.sh
+~/ai-phone-api/start-phone-ai-public.sh
 ~/ai-phone-api/stop-phone-ai-localtunnel.sh
 ~/ai-phone-api/stop-phone-ai-tunnel.sh
-~/ai-phone-api/stop-phone-ai-api.sh
+~/ai-phone-api/stop-phone-ai-all.sh
 ```
 
 The local API should expose:
