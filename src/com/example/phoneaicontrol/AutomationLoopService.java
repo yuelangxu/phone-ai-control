@@ -10,6 +10,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -737,6 +738,8 @@ public class AutomationLoopService extends Service {
                         result = executeAlarmAction(payload);
                     } else if ("timer".equals(type)) {
                         result = executeTimerAction(payload);
+                    } else if ("open_app".equals(type)) {
+                        result = executeOpenAppAction(payload);
                     } else {
                         throw new IllegalArgumentException("Unsupported device action type: " + type);
                     }
@@ -886,6 +889,42 @@ public class AutomationLoopService extends Service {
                     startActivity(intent);
                     result.put("length_seconds", payload.getInt("length_seconds"));
                     result.put("message", payload.optString("message", ""));
+                    result.put("executed_by", "phone_ai_control_service");
+                } catch (Exception e) {
+                    error[0] = e;
+                } finally {
+                    latch.countDown();
+                }
+            }
+        });
+        latch.await(10, TimeUnit.SECONDS);
+        if (error[0] != null) {
+            throw error[0];
+        }
+        return result;
+    }
+
+    private JSONObject executeOpenAppAction(final JSONObject payload) throws Exception {
+        final Exception[] error = new Exception[1];
+        final JSONObject result = new JSONObject();
+        final CountDownLatch latch = new CountDownLatch(1);
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String packageName = payload.optString("package_name", "").trim();
+                    if (packageName.isEmpty()) {
+                        throw new IllegalArgumentException("package_name is required");
+                    }
+                    PackageManager packageManager = getPackageManager();
+                    Intent intent = packageManager.getLaunchIntentForPackage(packageName);
+                    if (intent == null) {
+                        throw new IllegalStateException("No launch intent for package: " + packageName);
+                    }
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                    startActivity(intent);
+                    result.put("package_name", packageName);
+                    result.put("launched", true);
                     result.put("executed_by", "phone_ai_control_service");
                 } catch (Exception e) {
                     error[0] = e;
