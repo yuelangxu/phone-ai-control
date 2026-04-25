@@ -96,9 +96,7 @@ This project is open source. Anyone who forks, modifies, deploys, or republishes
 
 ## Contact
 
-For project questions, use the repository issue tracker or repository contact method:
-
-- GitHub repository: `https://github.com/yuelangxu/phone-ai-control`
+For project questions, use the repository issue tracker or the distribution channel provided by the publisher of your copy of this app.
 
 ## Changes
 

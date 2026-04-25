@@ -31,20 +31,27 @@ When configured, the app/service will update `relay/current_device.json` automat
 
 ## What GitHub stores
 
-- The phone bearer token should be stored as a **GitHub Actions secret** named `PHONE_API_BEARER_TOKEN`
-- The phone public URL can be stored either as:
-  - a **GitHub Actions secret** named `PHONE_API_PUBLIC_URL`, or
-  - a committed private file at `relay/current_device.json`
+The relay repository should stay private.
 
-Do not commit the real bearer token to the repository.
+`Phone AI Control` can bootstrap a private relay repository in a file-based way:
+
+- `relay/current_device.json`
+  - current public URL
+  - health and sync metadata
+- `relay/phone_api_secret.json`
+  - the phone API bearer token used by the relay workflow
+
+This design lets the phone set up the relay repo without separately configuring GitHub Actions secrets.
 
 ## Required repo setup
 
 1. Use a private repository.
-2. Add these repo secrets:
-   - `PHONE_API_BEARER_TOKEN`
-   - `PHONE_API_PUBLIC_URL` (optional if you use `relay/current_device.json`)
-3. If you prefer file-based device state, copy `relay/current_device.example.json` to `relay/current_device.json` and replace the placeholder URL.
+2. Either let `Phone AI Control` bootstrap the repo automatically, or add these files yourself:
+   - `relay/current_device.json`
+   - `relay/phone_api_secret.json`
+3. If you prefer a manual start, copy:
+   - `relay/current_device.example.json` to `relay/current_device.json`
+   - `relay/phone_api_secret.example.json` to `relay/phone_api_secret.json`
 
 ## Relay request format
 
@@ -95,11 +102,11 @@ Use `relay/openapi-github-relay.json` as the GPT action schema.
 Authentication should be configured against the GitHub API, not the phone API:
 
 - auth type: API key or bearer
-- value: a GitHub token that can create and read issues in this repo
+- value: a GitHub token that can create and read issues in the private relay repo
 
 Your GPT should:
 
-1. create a relay issue
+1. create a relay issue in the configured private relay repo
 2. remember the returned issue number
 3. poll the issue comments until a `<!-- phone-ai-relay-response -->` comment appears
 

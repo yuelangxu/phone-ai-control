@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "GitHub Phone API Relay",
-    "version": "1.0.0",
-    "description": "Submit a phone API request into the private GitHub relay repo as an issue, then poll the issue and its comments for the result produced by GitHub Actions."
+    "version": "1.0.1",
+    "description": "Submit a phone API request into a private GitHub relay repository as an issue, then poll the issue and its comments for the result produced by GitHub Actions."
   },
   "servers": [
     {
@@ -25,10 +25,30 @@
     }
   ],
   "paths": {
-    "/repos/yuelangxu/phone-ai-control/issues": {
+    "/repos/{owner}/{repo}/issues": {
       "post": {
         "operationId": "createPhoneRelayIssue",
         "summary": "Create a GitHub issue that asks the relay workflow to call the phone API.",
+        "parameters": [
+          {
+            "name": "owner",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "GitHub account or organization that owns the private relay repository."
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Private relay repository name."
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -66,11 +86,27 @@
         }
       }
     },
-    "/repos/yuelangxu/phone-ai-control/issues/{issue_number}": {
+    "/repos/{owner}/{repo}/issues/{issue_number}": {
       "get": {
         "operationId": "getPhoneRelayIssue",
         "summary": "Get the current status of a relay issue.",
         "parameters": [
+          {
+            "name": "owner",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "issue_number",
             "in": "path",
@@ -87,11 +123,27 @@
         }
       }
     },
-    "/repos/yuelangxu/phone-ai-control/issues/{issue_number}/comments": {
+    "/repos/{owner}/{repo}/issues/{issue_number}/comments": {
       "get": {
         "operationId": "listPhoneRelayIssueComments",
         "summary": "Read relay results posted back by GitHub Actions.",
         "parameters": [
+          {
+            "name": "owner",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "issue_number",
             "in": "path",
@@ -111,6 +163,22 @@
         "operationId": "commentPhoneRelayIssue",
         "summary": "Add a comment such as /phone-relay-run to re-trigger the relay workflow for an existing issue.",
         "parameters": [
+          {
+            "name": "owner",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "issue_number",
             "in": "path",
@@ -145,10 +213,28 @@
         }
       }
     },
-    "/repos/yuelangxu/phone-ai-control/contents/relay/current_device.json": {
+    "/repos/{owner}/{repo}/contents/relay/current_device.json": {
       "get": {
         "operationId": "getCurrentPhoneRelayDevice",
         "summary": "Read the current phone relay device metadata from the repo.",
+        "parameters": [
+          {
+            "name": "owner",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Current device file metadata"

@@ -41,7 +41,13 @@ final class GitHubRelaySync {
     private static final String DEFAULT_API_BASE = "https://api.github.com";
     private static final String DEFAULT_LOCAL_API = "http://127.0.0.1:8787";
     private static final String DEFAULT_BRANCH = "main";
+    private static final String DEFAULT_RELAY_REPO = "phone-ai-relay-private";
     private static final String DEFAULT_CONTENTS_PATH = "relay/current_device.json";
+    private static final String DEFAULT_DEVICE_NAME = "Android Phone";
+    private static final String BOOTSTRAP_WORKFLOW_PATH = ".github/workflows/phone-api-github-relay.yml";
+    private static final String BOOTSTRAP_SCRIPT_PATH = "relay/github_issue_relay.py";
+    private static final String BOOTSTRAP_ISSUE_TEMPLATE_PATH = ".github/ISSUE_TEMPLATE/phone-relay.md";
+    private static final String BOOTSTRAP_PHONE_SECRET_PATH = "relay/phone_api_secret.json";
     private static final long MIN_ATTEMPT_INTERVAL_MS = 20_000L;
     private static final long HEARTBEAT_INTERVAL_MS = 5L * 60L * 1000L;
     private static final int HTTP_TIMEOUT_MS = 8000;
@@ -76,6 +82,96 @@ final class GitHubRelaySync {
             return "";
         }
         return loadGitHubToken(context, config);
+    }
+
+    static synchronized String loadBootstrapToken(Context context) {
+        try {
+            File file = resolveDefaultTokenFile(context);
+            if (!file.exists() || !file.isFile()) {
+                return "";
+            }
+            return new String(readFileUpTo(file, 32 * 1024), StandardCharsets.UTF_8).trim();
+        } catch (Exception e) {
+            logError("Failed to load bootstrap GitHub token.", e);
+            return "";
+        }
+    }
+
+    static synchronized boolean hasLocalRelayConfig(Context context) {
+        JSONObject config = loadConfig(context);
+        if (config == null) {
+            return false;
+        }
+        return !config.optString("owner", "").trim().isEmpty()
+                && !config.optString("repo", "").trim().isEmpty();
+    }
+
+    static synchronized String buildTokenSetupUrl() {
+        return "https://github.com/settings/personal-access-tokens/new"
+                + "?name=Phone%20AI%20Control%20Relay"
+                + "&description=Allow%20Phone%20AI%20Control%20to%20create%20a%20private%20relay%20repository%20and%20sync%20device%20state"
+                + "&expires_in=30"
+                + "&administration=write"
+                + "&contents=write"
+                + "&issues=write"
+                + "&metadata=read";
+    }
+
+    static synchronized JSONObject clearLocalBinding(Context context) {
+        deleteQuietly(resolveConfigFile(context));
+        deleteQuietly(resolveStateFile(context));
+        deleteQuietly(resolveDefaultTokenFile(context));
+        return writeState(context, buildUnconfiguredState(context, "GitHub relay local binding was cleared."));
+    }
+
+    static synchronized JSONObject bootstrapFromGitHubToken(Context context, String githubToken, String phoneApiToken) {
+        String normalizedGitHubToken = githubToken == null ? "" : githubToken.trim();
+        String normalizedPhoneToken = phoneApiToken == null ? "" : phoneApiToken.trim();
+        if (normalizedGitHubToken.isEmpty()) {
+            return writeState(context, buildUnconfiguredState(context, "GitHub token is missing."));
+        }
+        if (normalizedPhoneToken.isEmpty()) {
+            return writeState(context, buildUnconfiguredState(context, "Phone API token is missing."));
+        }
+        try {
+            JSONObject user = getAuthenticatedUser(DEFAULT_API_BASE, normalizedGitHubToken);
+            String login = user.optString("login", "").trim();
+            if (login.isEmpty()) {
+                throw new IllegalStateException("GitHub user login is missing from /user.");
+            }
+
+            JSONObject config = new JSONObject();
+            config.put("enabled", true);
+            config.put("api_base", DEFAULT_API_BASE);
+            config.put("owner", login);
+            config.put("repo", DEFAULT_RELAY_REPO);
+            config.put("branch", DEFAULT_BRANCH);
+            config.put("contents_path", DEFAULT_CONTENTS_PATH);
+            config.put("device_id", "phone-main");
+            config.put("device_name", DEFAULT_DEVICE_NAME);
+            config.put("github_token_file", "github-relay-token.txt");
+
+            writeTextFile(resolveDefaultTokenFile(context), normalizedGitHubToken + "\n");
+            writeJsonFile(resolveConfigFile(context), config);
+
+            RepoResult repoResult = ensureRepositoryExists(config, normalizedGitHubToken, true);
+            bootstrapRepositoryFiles(config, normalizedGitHubToken, normalizedPhoneToken);
+            JSONObject state = triggerSyncFromPhoneContext(context, "github_bootstrap", true);
+            putSafe(state, "repo_exists", repoResult.exists);
+            putSafe(state, "repo_created", repoResult.created);
+            putSafe(state, "repo_url", emptyToNull(repoResult.repoHtmlUrl));
+            putSafe(state, "last_ok", true);
+            putSafe(state, "last_message", repoResult.created
+                    ? "GitHub relay repo was created and bootstrapped."
+                    : "GitHub relay repo is ready and bootstrapped.");
+            putSafe(state, "last_success_epoch_ms", System.currentTimeMillis());
+            return writeState(context, state);
+        } catch (Exception e) {
+            logError("GitHub relay bootstrap failed.", e);
+            JSONObject failed = buildUnconfiguredState(context, "GitHub bootstrap failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            putSafe(failed, "last_ok", false);
+            return writeState(context, failed);
+        }
     }
 
     static synchronized JSONObject ensureRelayRepository(Context context, boolean allowCreate) {
@@ -124,6 +220,25 @@ final class GitHubRelaySync {
             logError("Repository ensure failed.", e);
         }
         return writeState(context, state);
+    }
+
+    private static JSONObject getAuthenticatedUser(String apiBase, String token) throws Exception {
+        HttpResult result = requestJson("GET", trimTrailingSlash(apiBase) + "/user", token, null);
+        if (result.statusCode < 200 || result.statusCode >= 300) {
+            throw new IllegalStateException("GitHub user lookup failed with HTTP " + result.statusCode + ": " + truncate(result.body, 220));
+        }
+        return new JSONObject(result.body);
+    }
+
+    private static void bootstrapRepositoryFiles(JSONObject config, String githubToken, String phoneApiToken) throws Exception {
+        putRepoTextFile(config, githubToken, BOOTSTRAP_WORKFLOW_PATH, buildBootstrapWorkflow(), "bootstrap relay workflow");
+        putRepoTextFile(config, githubToken, BOOTSTRAP_SCRIPT_PATH, buildBootstrapScript(), "bootstrap relay runner");
+        putRepoTextFile(config, githubToken, BOOTSTRAP_ISSUE_TEMPLATE_PATH, buildBootstrapIssueTemplate(), "bootstrap relay issue template");
+
+        JSONObject phoneSecret = new JSONObject();
+        phoneSecret.put("updated_at", iso8601Utc(System.currentTimeMillis()));
+        phoneSecret.put("phone_api_bearer_token", phoneApiToken);
+        putRepoTextFile(config, githubToken, BOOTSTRAP_PHONE_SECRET_PATH, phoneSecret.toString(2) + "\n", "bootstrap phone api token store");
     }
 
     static synchronized JSONObject triggerSyncFromPhoneContext(Context context, String syncSource, boolean force) {
@@ -842,6 +957,40 @@ final class GitHubRelaySync {
         return new HttpResult(code, response);
     }
 
+    private static void putRepoTextFile(JSONObject config, String token, String path, String content, String commitSummary) throws Exception {
+        SyncTarget target = resolveTarget(config, path);
+        HttpResult existing = getExistingContents(target, token);
+        String existingSha = "";
+        String existingContent = "";
+        if (existing.statusCode == 200 && existing.body != null && !existing.body.isEmpty()) {
+            JSONObject payload = new JSONObject(existing.body);
+            existingSha = payload.optString("sha", "").trim();
+            String encoded = payload.optString("content", "").replace("\n", "").replace("\r", "").trim();
+            if (!encoded.isEmpty()) {
+                try {
+                    existingContent = new String(Base64.decode(encoded, Base64.DEFAULT), StandardCharsets.UTF_8);
+                } catch (Exception ignored) {
+                    existingContent = "";
+                }
+            }
+        }
+        if (content.equals(existingContent)) {
+            return;
+        }
+
+        JSONObject requestBody = new JSONObject();
+        requestBody.put("message", "phone relay bootstrap: " + commitSummary);
+        requestBody.put("branch", target.branch);
+        requestBody.put("content", Base64.encodeToString(content.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
+        if (!existingSha.isEmpty()) {
+            requestBody.put("sha", existingSha);
+        }
+        HttpResult putResult = requestJson("PUT", target.contentsApiUrl, token, requestBody.toString());
+        if (putResult.statusCode < 200 || putResult.statusCode >= 300) {
+            throw new IllegalStateException("GitHub file bootstrap failed for " + path + " with HTTP " + putResult.statusCode + ": " + truncate(putResult.body, 220));
+        }
+    }
+
     private static String computeSemanticHash(JSONObject payload) {
         try {
             JSONObject copy = cloneObject(payload);
@@ -914,6 +1063,33 @@ final class GitHubRelaySync {
         return trimmed.isEmpty() ? defaultValue : trimmed;
     }
 
+    private static void writeJsonFile(File target, JSONObject object) throws Exception {
+        writeTextFile(target, object.toString(2) + "\n");
+    }
+
+    private static void writeTextFile(File target, String text) throws Exception {
+        File parent = target.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
+            throw new IllegalStateException("Could not create folder: " + parent.getAbsolutePath());
+        }
+        FileOutputStream stream = new FileOutputStream(target, false);
+        try {
+            stream.write(text.getBytes(StandardCharsets.UTF_8));
+            stream.flush();
+        } finally {
+            stream.close();
+        }
+    }
+
+    private static void deleteQuietly(File target) {
+        try {
+            if (target != null && target.exists()) {
+                target.delete();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     private static JSONObject cloneObject(JSONObject object) {
         if (object == null) {
             return new JSONObject();
@@ -930,6 +1106,295 @@ final class GitHubRelaySync {
             object.put(key, value == null ? JSONObject.NULL : value);
         } catch (Exception ignored) {
         }
+    }
+
+    private static SyncTarget resolveTarget(JSONObject config, String contentsPath) {
+        String apiBase = emptyToDefault(config.optString("api_base", ""), DEFAULT_API_BASE);
+        String owner = config.optString("owner", "").trim();
+        String repo = config.optString("repo", "").trim();
+        String branch = emptyToDefault(config.optString("branch", ""), DEFAULT_BRANCH);
+        String normalizedContentsPath = emptyToDefault(contentsPath, DEFAULT_CONTENTS_PATH);
+        String encodedBranch;
+        try {
+            encodedBranch = URLEncoder.encode(branch, "UTF-8");
+        } catch (Exception e) {
+            encodedBranch = branch;
+        }
+        String contentsApiUrl = trimTrailingSlash(apiBase) + "/repos/" + owner + "/" + repo + "/contents/" + normalizedContentsPath;
+        String getUrl = contentsApiUrl + "?ref=" + encodedBranch;
+        return new SyncTarget(contentsApiUrl, getUrl, branch);
+    }
+
+    private static String buildBootstrapWorkflow() {
+        return String.join("\n",
+                "name: Phone API GitHub Relay",
+                "",
+                "on:",
+                "  issues:",
+                "    types: [opened, reopened]",
+                "  issue_comment:",
+                "    types: [created]",
+                "",
+                "permissions:",
+                "  contents: read",
+                "  issues: write",
+                "",
+                "jobs:",
+                "  relay:",
+                "    if: |",
+                "      (github.event_name == 'issues' && contains(join(github.event.issue.labels.*.name, ','), 'phone-relay')) ||",
+                "      (github.event_name == 'issue_comment' && contains(join(github.event.issue.labels.*.name, ','), 'phone-relay') && contains(github.event.comment.body, '/phone-relay-run'))",
+                "    runs-on: ubuntu-latest",
+                "    steps:",
+                "      - name: Check out repository",
+                "        uses: actions/checkout@v4",
+                "",
+                "      - name: Set up Python",
+                "        uses: actions/setup-python@v5",
+                "        with:",
+                "          python-version: \"3.x\"",
+                "",
+                "      - name: Run phone API relay",
+                "        env:",
+                "          RELAY_RESULT_PATH: ${{ runner.temp }}/phone_api_relay_result.json",
+                "        run: python relay/github_issue_relay.py",
+                "",
+                "      - name: Post result back to issue",
+                "        uses: actions/github-script@v7",
+                "        env:",
+                "          RELAY_RESULT_PATH: ${{ runner.temp }}/phone_api_relay_result.json",
+                "        with:",
+                "          github-token: ${{ secrets.GITHUB_TOKEN }}",
+                "          script: |",
+                "            const fs = require('fs');",
+                "            const result = JSON.parse(fs.readFileSync(process.env.RELAY_RESULT_PATH, 'utf8'));",
+                "            const owner = context.repo.owner;",
+                "            const repo = context.repo.repo;",
+                "            const issue_number = context.payload.issue.number;",
+                "",
+                "            await github.rest.issues.createComment({",
+                "              owner,",
+                "              repo,",
+                "              issue_number,",
+                "              body: result.comment_body",
+                "            });",
+                "",
+                "            const labelsToAdd = [result.ok ? 'relay-completed' : 'relay-failed'];",
+                "            for (const label of ['relay-pending', 'relay-completed', 'relay-failed']) {",
+                "              try {",
+                "                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: label });",
+                "              } catch (error) {",
+                "                core.info(`Label ${label} was not present: ${error.message}`);",
+                "              }",
+                "            }",
+                "",
+                "            await github.rest.issues.addLabels({ owner, repo, issue_number, labels: labelsToAdd });",
+                "",
+                "            if (result.close_issue) {",
+                "              await github.rest.issues.update({ owner, repo, issue_number, state: 'closed' });",
+                "            }",
+                "");
+    }
+
+    private static String buildBootstrapScript() {
+        return String.join("\n",
+                "import json",
+                "import os",
+                "import pathlib",
+                "import re",
+                "import sys",
+                "import urllib.error",
+                "import urllib.parse",
+                "import urllib.request",
+                "from datetime import datetime, timezone",
+                "",
+                "REQUEST_MARKER = \"<!-- phone-ai-relay-request -->\"",
+                "RESULT_PATH = os.environ[\"RELAY_RESULT_PATH\"]",
+                "WORKSPACE = pathlib.Path(os.environ.get(\"GITHUB_WORKSPACE\", \".\")).resolve()",
+                "EVENT_PATH = pathlib.Path(os.environ[\"GITHUB_EVENT_PATH\"]).resolve()",
+                "",
+                "def utc_now() -> str:",
+                "    return datetime.now(timezone.utc).strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+                "",
+                "def load_json(path: pathlib.Path) -> dict:",
+                "    return json.loads(path.read_text(encoding=\"utf-8\"))",
+                "",
+                "def load_event() -> dict:",
+                "    return load_json(EVENT_PATH)",
+                "",
+                "def parse_request_body(issue_body: str) -> dict:",
+                "    body = issue_body or \"\"",
+                "    if REQUEST_MARKER not in body:",
+                "        raise ValueError(\"Issue body is missing the phone relay marker.\")",
+                "    fenced = re.search(r\"```json\\s*(\\{.*?\\})\\s*```\", body, re.DOTALL)",
+                "    payload_text = fenced.group(1) if fenced else body.split(REQUEST_MARKER, 1)[1].strip()",
+                "    payload = json.loads(payload_text)",
+                "    if not isinstance(payload, dict):",
+                "        raise ValueError(\"Relay payload must be a JSON object.\")",
+                "    path = str(payload.get(\"path\", \"\")).strip()",
+                "    method = str(payload.get(\"method\", \"GET\")).strip().upper()",
+                "    if not path.startswith(\"/\"):",
+                "        raise ValueError(\"Relay payload path must start with '/'.\")",
+                "    if method not in {\"GET\", \"POST\", \"PUT\", \"PATCH\", \"DELETE\"}:",
+                "        raise ValueError(f\"Unsupported method: {method}\")",
+                "    if not path.startswith(\"/v1/\") and path != \"/healthz\":",
+                "        raise ValueError(\"Relay path must target /healthz or /v1/* only.\")",
+                "    payload[\"timeout_sec\"] = max(5, min(int(payload.get(\"timeout_sec\", 45) or 45), 120))",
+                "    payload[\"close_issue\"] = bool(payload.get(\"close_issue\", True))",
+                "    query = payload.get(\"query\")",
+                "    if query is not None and not isinstance(query, dict):",
+                "        raise ValueError(\"query must be an object when provided.\")",
+                "    expected_status = payload.get(\"expected_status\")",
+                "    if expected_status is not None:",
+                "        if isinstance(expected_status, int):",
+                "            expected_status = [expected_status]",
+                "        if not isinstance(expected_status, list) or not expected_status:",
+                "            raise ValueError(\"expected_status must be an integer or a non-empty list of integers.\")",
+                "        payload[\"expected_status\"] = [int(item) for item in expected_status]",
+                "    return payload",
+                "",
+                "def load_public_url() -> str:",
+                "    current_device = WORKSPACE / \"relay\" / \"current_device.json\"",
+                "    data = load_json(current_device)",
+                "    public_url = str(data.get(\"public_url\", \"\")).strip().rstrip(\"/\")",
+                "    if not public_url:",
+                "        raise RuntimeError(\"relay/current_device.json does not contain a public_url.\")",
+                "    return public_url",
+                "",
+                "def load_bearer_token() -> str:",
+                "    secret_file = WORKSPACE / \"relay\" / \"phone_api_secret.json\"",
+                "    data = load_json(secret_file)",
+                "    token = str(data.get(\"phone_api_bearer_token\", \"\")).strip()",
+                "    if not token:",
+                "        raise RuntimeError(\"relay/phone_api_secret.json does not contain a phone_api_bearer_token.\")",
+                "    return token",
+                "",
+                "def build_target_url(public_url: str, payload: dict) -> str:",
+                "    path = str(payload[\"path\"]).strip()",
+                "    query = payload.get(\"query\") or {}",
+                "    if not query:",
+                "        return public_url + path",
+                "    normalized_query = []",
+                "    for key, value in query.items():",
+                "        if isinstance(value, list):",
+                "            for item in value:",
+                "                normalized_query.append((key, str(item)))",
+                "        else:",
+                "            normalized_query.append((key, str(value)))",
+                "    return public_url + path + \"?\" + urllib.parse.urlencode(normalized_query, doseq=True)",
+                "",
+                "def make_request(public_url: str, token: str, payload: dict) -> dict:",
+                "    method = str(payload.get(\"method\", \"GET\")).upper()",
+                "    url = build_target_url(public_url, payload)",
+                "    request_body = payload.get(\"body\")",
+                "    body_bytes = None",
+                "    headers = {",
+                "        \"User-Agent\": \"phone-ai-github-relay/1.0\",",
+                "        \"Accept\": \"application/json\",",
+                "        \"Authorization\": f\"Bearer {token}\",",
+                "        \"bypass-tunnel-reminder\": \"1\",",
+                "    }",
+                "    if request_body is not None:",
+                "        body_bytes = json.dumps(request_body).encode(\"utf-8\")",
+                "        headers[\"Content-Type\"] = \"application/json; charset=utf-8\"",
+                "    request = urllib.request.Request(url, data=body_bytes, method=method, headers=headers)",
+                "    try:",
+                "        with urllib.request.urlopen(request, timeout=int(payload.get(\"timeout_sec\", 45))) as response:",
+                "            raw = response.read()",
+                "            status = response.getcode()",
+                "            content_type = response.headers.get(\"Content-Type\", \"\")",
+                "    except urllib.error.HTTPError as error:",
+                "        raw = error.read()",
+                "        status = error.code",
+                "        content_type = error.headers.get(\"Content-Type\", \"\")",
+                "    except Exception as error:",
+                "        return {\"ok\": False, \"status_code\": -1, \"content_type\": \"text/plain\", \"response_text\": f\"{type(error).__name__}: {error}\"}",
+                "    response_text = raw.decode(\"utf-8\", errors=\"replace\")",
+                "    expected_status = payload.get(\"expected_status\")",
+                "    ok = status in expected_status if expected_status else 200 <= status < 300",
+                "    result = {\"ok\": ok, \"status_code\": status, \"content_type\": content_type, \"response_text\": response_text}",
+                "    if \"json\" in content_type.lower():",
+                "        try:",
+                "            result[\"response_json\"] = json.loads(response_text)",
+                "        except json.JSONDecodeError:",
+                "            pass",
+                "    return result",
+                "",
+                "def truncate_text(text: str, max_chars: int = 50000) -> str:",
+                "    return text if len(text) <= max_chars else text[:max_chars] + \"\\n... [truncated]\"",
+                "",
+                "def build_comment(issue_number: int, public_url: str, payload: dict, result: dict) -> str:",
+                "    request_id = str(payload.get(\"request_id\", f\"issue-{issue_number}\"))",
+                "    lines = [",
+                "        \"<!-- phone-ai-relay-response -->\",",
+                "        f\"Relay handled at: {utc_now()}\",",
+                "        f\"Request ID: {request_id}\",",
+                "        f\"Method: {str(payload.get('method', 'GET')).upper()}\",",
+                "        f\"Path: {payload.get('path', '')}\",",
+                "        f\"Phone API URL used: {public_url}\",",
+                "        f\"HTTP status: {result.get('status_code', -1)}\",",
+                "        f\"Result: {'completed' if result.get('ok') else 'failed'}\",",
+                "        \"\",",
+                "    ]",
+                "    if \"response_json\" in result:",
+                "        response_block = json.dumps(result[\"response_json\"], ensure_ascii=False, indent=2)",
+                "        lines.extend([\"```json\", truncate_text(response_block), \"```\"])",
+                "    else:",
+                "        lines.extend([\"```text\", truncate_text(result.get(\"response_text\", \"\")), \"```\"])",
+                "    return \"\\n\".join(lines)",
+                "",
+                "def write_result(ok: bool, comment_body: str, close_issue: bool = True) -> None:",
+                "    pathlib.Path(RESULT_PATH).write_text(json.dumps({\"ok\": ok, \"comment_body\": comment_body, \"close_issue\": close_issue}, ensure_ascii=False, indent=2), encoding=\"utf-8\")",
+                "",
+                "def main() -> int:",
+                "    event = load_event()",
+                "    issue = event.get(\"issue\") or {}",
+                "    issue_number = issue.get(\"number\", 0)",
+                "    try:",
+                "        payload = parse_request_body(issue.get(\"body\", \"\"))",
+                "        public_url = load_public_url()",
+                "        token = load_bearer_token()",
+                "        relay_result = make_request(public_url, token, payload)",
+                "        write_result(relay_result.get(\"ok\", False), build_comment(issue_number, public_url, payload, relay_result), close_issue=bool(payload.get(\"close_issue\", True)))",
+                "        return 0",
+                "    except Exception as error:",
+                "        comment_body = \"\\n\".join([",
+                "            \"<!-- phone-ai-relay-response -->\",",
+                "            f\"Relay handled at: {utc_now()}\",",
+                "            \"Result: failed before the phone request could be sent.\",",
+                "            \"\",",
+                "            \"```text\",",
+                "            truncate_text(f\"{type(error).__name__}: {error}\"),",
+                "            \"```\",",
+                "        ])",
+                "        write_result(False, comment_body, close_issue=True)",
+                "        return 0",
+                "",
+                "if __name__ == \"__main__\":",
+                "    sys.exit(main())",
+                "");
+    }
+
+    private static String buildBootstrapIssueTemplate() {
+        return String.join("\n",
+                "---",
+                "name: Phone relay request",
+                "about: Ask the private GitHub relay to call the phone API",
+                "title: \"phone relay: \"",
+                "labels: [\"phone-relay\", \"relay-pending\"]",
+                "assignees: []",
+                "---",
+                "",
+                "<!-- phone-ai-relay-request -->",
+                "```json",
+                "{",
+                "  \"request_id\": \"replace-this\",",
+                "  \"method\": \"GET\",",
+                "  \"path\": \"/v1/status\",",
+                "  \"close_issue\": true",
+                "}",
+                "```",
+                "");
     }
 
     private static String hexEncode(byte[] raw) {

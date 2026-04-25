@@ -2,7 +2,7 @@ name: Phone API GitHub Relay
 
 on:
   issues:
-    types: [opened, edited, reopened, labeled]
+    types: [opened, reopened]
   issue_comment:
     types: [created]
 

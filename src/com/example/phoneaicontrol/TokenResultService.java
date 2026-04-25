@@ -45,6 +45,7 @@ public class TokenResultService extends IntentService {
     public static final String ACTION_CONTROL_START_PUBLIC = "control_start_public";
     public static final String ACTION_CONTROL_STOP_PUBLIC = "control_stop_public";
     public static final String ACTION_CONTROL_STOP_ALL = "control_stop_all";
+    public static final String ACTION_READ_PHONE_API_TOKEN = "read_phone_api_token";
     public static final String BROADCAST_APPROVAL_RESULT = "com.example.phoneaicontrol.APPROVAL_RESULT";
     public static final String BROADCAST_COMMAND_RESULT = "com.example.phoneaicontrol.COMMAND_RESULT";
 
@@ -112,6 +113,8 @@ public class TokenResultService extends IntentService {
             Log.w(LOG_TAG, "Token copy failed. exitCode=" + exitCode + " errCode=" + errCode + " errMsg=" + errMsg + " stderr=" + stderr);
             if (ACTION_COPY_TOKEN.equals(action)) {
                 showToast(message.trim());
+            } else if (ACTION_READ_PHONE_API_TOKEN.equals(action)) {
+                broadcastCommandResult(action, false, message.trim(), stdout, stderr);
             } else {
                 broadcastApprovalResult(action, false, message.trim(), null);
             }
@@ -122,6 +125,8 @@ public class TokenResultService extends IntentService {
         if (token.isEmpty()) {
             if (ACTION_COPY_TOKEN.equals(action)) {
                 showToast("Token copy failed: empty token returned.");
+            } else if (ACTION_READ_PHONE_API_TOKEN.equals(action)) {
+                broadcastCommandResult(action, false, "Phone API token read failed: empty token returned.", stdout, stderr);
             } else {
                 broadcastApprovalResult(action, false, "Action failed: empty token returned.", null);
             }
@@ -140,6 +145,10 @@ public class TokenResultService extends IntentService {
                 || ACTION_CONTROL_STOP_PUBLIC.equals(action)
                 || ACTION_CONTROL_STOP_ALL.equals(action)) {
             handleControlAction(action, token);
+            return;
+        }
+        if (ACTION_READ_PHONE_API_TOKEN.equals(action)) {
+            broadcastCommandResult(action, true, "Phone API token loaded.", token, null);
             return;
         }
         if (!ACTION_COPY_TOKEN.equals(action)) {

@@ -77,9 +77,15 @@ def load_public_url() -> str:
 
 def load_bearer_token() -> str:
     token = os.environ.get("PHONE_API_BEARER_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("PHONE_API_BEARER_TOKEN secret is missing.")
-    return token
+    if token:
+        return token
+    secret_file = WORKSPACE / "relay" / "phone_api_secret.json"
+    if secret_file.exists():
+        data = json.loads(secret_file.read_text(encoding="utf-8"))
+        file_token = str(data.get("phone_api_bearer_token", "")).strip()
+        if file_token:
+            return file_token
+    raise RuntimeError("No phone API bearer token is configured. Set PHONE_API_BEARER_TOKEN or commit relay/phone_api_secret.json in the private relay repo.")
 
 
 def build_target_url(public_url: str, payload: dict) -> str:
