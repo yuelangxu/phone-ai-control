@@ -5,6 +5,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.app.ActivityManager;
+import android.app.AppOpsManager;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStats;
+import android.app.usage.UsageStatsManager;
 import android.content.BroadcastReceiver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -37,6 +42,9 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -59,6 +67,7 @@ public class AutomationLoopService extends Service {
     private static final long AUTO_INSTALL_MIN_INTERVAL_MS = 2000L;
     private static final long AUTO_DEVICE_ACTION_MIN_INTERVAL_MS = 1500L;
     private static final long BATTERY_PUSH_MIN_INTERVAL_MS = 15000L;
+    private static final long USAGE_PUSH_MIN_INTERVAL_MS = 15000L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable pollRunnable = new Runnable() {
@@ -106,6 +115,8 @@ public class AutomationLoopService extends Service {
     private boolean autoDeviceActionRequestInFlight = false;
     private long lastBatteryPushMs = 0L;
     private boolean batteryPushInFlight = false;
+    private long lastUsagePushMs = 0L;
+    private boolean usagePushInFlight = false;
 
     public static void start(Context context) {
         if (!AutomationSettings.isPollingEnabled(context)) {
@@ -174,6 +185,7 @@ public class AutomationLoopService extends Service {
 
     private void pollOnce() {
         pushBatteryStatusIfNeeded();
+        pushUsageSnapshotIfNeeded();
         maybeAutoHandleInstallRequests();
         maybeAutoHandleDeviceActions();
     }
@@ -539,6 +551,27 @@ public class AutomationLoopService extends Service {
         }).start();
     }
 
+    private void pushUsageSnapshotIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (usagePushInFlight || now - lastUsagePushMs < USAGE_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        usagePushInFlight = true;
+        lastUsagePushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectUsageSnapshot();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/usage", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    usagePushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
     private JSONObject collectBatteryStatus() throws Exception {
         Intent batteryIntent = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         if (batteryIntent == null) {
@@ -566,6 +599,109 @@ public class AutomationLoopService extends Service {
         return payload;
     }
 
+    private boolean hasUsageAccess() {
+        if (Build.VERSION.SDK_INT < 21) {
+            return false;
+        }
+        try {
+            AppOpsManager appOps = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
+            if (appOps == null) {
+                return false;
+            }
+            int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), getPackageName());
+            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private JSONObject collectUsageSnapshot() throws Exception {
+        JSONObject payload = new JSONObject();
+        payload.put("source", "phone_ai_control_service");
+        payload.put("captured_epoch_ms", System.currentTimeMillis());
+        payload.put("usage_access_granted", hasUsageAccess());
+
+        ActivityManager activityManager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        if (activityManager != null) {
+            ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
+            activityManager.getMemoryInfo(memoryInfo);
+            JSONObject memory = new JSONObject();
+            memory.put("avail_mem_bytes", memoryInfo.availMem);
+            memory.put("total_mem_bytes", memoryInfo.totalMem);
+            memory.put("threshold_bytes", memoryInfo.threshold);
+            memory.put("low_memory", memoryInfo.lowMemory);
+            payload.put("memory", memory);
+        }
+
+        if (!hasUsageAccess() || Build.VERSION.SDK_INT < 21) {
+            return payload;
+        }
+
+        UsageStatsManager usageStatsManager = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+        if (usageStatsManager == null) {
+            return payload;
+        }
+
+        long end = System.currentTimeMillis();
+        long start = end - (15L * 60L * 1000L);
+        UsageEvents events = usageStatsManager.queryEvents(start, end);
+        UsageEvents.Event event = new UsageEvents.Event();
+        String foregroundPackage = null;
+        String foregroundClass = null;
+        String foregroundEvent = null;
+        long foregroundAt = 0L;
+        while (events != null && events.hasNextEvent()) {
+            events.getNextEvent(event);
+            int type = event.getEventType();
+            boolean isForeground = type == UsageEvents.Event.MOVE_TO_FOREGROUND
+                    || (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_RESUMED);
+            if (!isForeground) {
+                continue;
+            }
+            foregroundPackage = event.getPackageName();
+            foregroundClass = event.getClassName();
+            foregroundEvent = usageEventLabel(type);
+            foregroundAt = event.getTimeStamp();
+        }
+        if (foregroundPackage != null && !foregroundPackage.isEmpty()) {
+            JSONObject foreground = new JSONObject();
+            foreground.put("package", foregroundPackage);
+            foreground.put("class", foregroundClass == null ? JSONObject.NULL : foregroundClass);
+            foreground.put("event", foregroundEvent == null ? JSONObject.NULL : foregroundEvent);
+            foreground.put("event_epoch_ms", foregroundAt);
+            payload.put("foreground", foreground);
+        }
+
+        List<UsageStats> stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, end);
+        if (stats != null && !stats.isEmpty()) {
+            Collections.sort(stats, new Comparator<UsageStats>() {
+                @Override
+                public int compare(UsageStats left, UsageStats right) {
+                    return Long.compare(right.getLastTimeUsed(), left.getLastTimeUsed());
+                }
+            });
+            JSONArray recent = new JSONArray();
+            int added = 0;
+            for (UsageStats stat : stats) {
+                if (stat == null || stat.getPackageName() == null || stat.getPackageName().isEmpty()) {
+                    continue;
+                }
+                JSONObject item = new JSONObject();
+                item.put("package", stat.getPackageName());
+                item.put("last_time_used_epoch_ms", stat.getLastTimeUsed());
+                item.put("total_time_in_foreground_ms", stat.getTotalTimeInForeground());
+                recent.put(item);
+                added++;
+                if (added >= 10) {
+                    break;
+                }
+            }
+            payload.put("recent_packages", recent);
+        }
+
+        return payload;
+    }
+
     private String batteryStatusLabel(int status) {
         switch (status) {
             case BatteryManager.BATTERY_STATUS_CHARGING:
@@ -578,6 +714,23 @@ public class AutomationLoopService extends Service {
                 return "not_charging";
             default:
                 return "unknown";
+        }
+    }
+
+    private String usageEventLabel(int type) {
+        switch (type) {
+            case UsageEvents.Event.MOVE_TO_FOREGROUND:
+                return "move_to_foreground";
+            case UsageEvents.Event.MOVE_TO_BACKGROUND:
+                return "move_to_background";
+            default:
+                if (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    return "activity_resumed";
+                }
+                if (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_PAUSED) {
+                    return "activity_paused";
+                }
+                return String.valueOf(type);
         }
     }
 

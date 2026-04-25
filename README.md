@@ -9,10 +9,13 @@ It is no longer just a tunnel toggle. The current app can:
 - copy the current public URL
 - copy the API bearer token on demand and clear it from clipboard after 20 seconds
 - show battery information through the local API bridge
+- show usage-access state plus cached usage and memory-pressure information from the Android side
+- expose a cleaner diagnostics bridge to the phone API so a trusted GPT can request one-shot snapshots or bounded polling instead of relying on constant UI polling
 - execute device actions requested by the API:
   - notifications
   - alarms with remarks/messages and repeat days
   - timers with remarks/messages
+  - open installed apps by package name
 - broker shared-storage file operations on behalf of the Termux API:
   - `list_dir`
   - `read_file`
@@ -49,6 +52,18 @@ This matters because it explains a lot of the real-world behavior:
 - Shows whether public exposure is enabled and reachable.
 - Uses dedicated Termux wrapper scripts for start/stop flows instead of a long fragile inline shell chain.
 - Follows the current Termux-side port automatically by reading Termux-owned runtime state instead of assuming a fixed port forever.
+- Refreshing status no longer disables every button, so the UI stays usable while the app is checking the backend.
+- Local API discovery now validates the discovered port with `/healthz` before updating the UI, which avoids the old "discovered stale port vs failed connect" details flicker.
+
+### Diagnostics Bridge
+
+- Exposes Android-side battery caching back to the API.
+- Exposes usage-access state plus memory-pressure data back to the API.
+- Supports a one-shot diagnostics snapshot model for GPT use.
+- Supports bounded diagnostics polling with interval and sample limits when short-term monitoring is actually needed.
+- Keeps the API honest about limits:
+  - full-system CPU and GPU truth still needs ADB shell, Shizuku, or root
+  - ordinary Termux plus an ordinary app cannot provide unrestricted privileged logs or process inspection
 
 ### Background Polling
 
@@ -72,6 +87,26 @@ This matters because it explains a lot of the real-world behavior:
 - Timer endpoint
 - Battery endpoint
 - APK install endpoint
+- Open-app endpoint
+
+### Custom GPT Builder Assets
+
+This repository now includes builder-facing assets for a private Custom GPT:
+
+- `PRIVACY.md` for the GPT action privacy-policy field
+- `knowledge/` for GPT Knowledge uploads
+- the main project `README.md` for a human overview
+
+Recommended Knowledge uploads:
+
+- `knowledge/01-phone-ai-agent-overview.md`
+- `knowledge/02-phone-ai-agent-operating-rules.md`
+- `knowledge/03-phone-ai-agent-endpoints-reference.md`
+- `knowledge/04-phone-ai-agent-environment-expansion.md`
+
+Recommended Instructions seed:
+
+- `knowledge/05-custom-gpt-instructions-template.md`
 
 ### Token Handling
 
@@ -106,6 +141,7 @@ The token still belongs to the Termux-side API because the API process validates
 - There is no true Android stopwatch control API in this project yet.
 - The app does not silently install APKs; it launches Android's installer flow and the user still confirms the install.
 - Force-stopping the app does not automatically shut down Termux's own API/tunnel processes.
+- The public API still does not expose arbitrary Termux package installation. Environment expansion such as a C toolchain should be added later through a strict allowlist API rather than raw shell access.
 
 ## Known Friction And How To Avoid It
 
@@ -124,6 +160,16 @@ To reduce confusion:
 ### 2. Termux may need to be warm after backend restarts
 
 On this phone, after some backend restarts, opening Termux once helps the local API recover more reliably.
+
+### 2.5. Free tunnels can still disappear on their own
+
+The no-account localtunnel fallback is convenient but not fully stable. A URL can become `None` in the app even if you did not press stop, simply because the external tunnel disconnected.
+
+To reduce confusion:
+
+- use `Refresh Status` before assuming the app is wrong
+- expect the public URL to change after a tunnel restart
+- consider Cloudflare with your own account and domain if you want a steadier long-term setup
 
 ### 3. Shared storage is not the same as app-private storage
 
@@ -175,10 +221,13 @@ adb shell pm grant com.example.phoneaicontrol com.termux.permission.RUN_COMMAND
 
 If shared storage mediation is needed, also grant Android-side all-files access from settings.
 
+If usage-aware diagnostics are needed, also grant Usage Access from Android settings.
+
 ## Recommended Operating Rules
 
 - Keep polling enabled only when you need background device actions.
 - Set polling to `0` when you want the app quiet.
+- Prefer one-shot diagnostics snapshots over constant polling when building GPT workflows.
 - Do not assume the public URL is stable across restarts.
 - Treat `force stop` as "pause the mediator", not "destroy the whole phone API stack".
 - Prefer the app's own stop buttons when you want the Termux API/tunnel to actually stop.

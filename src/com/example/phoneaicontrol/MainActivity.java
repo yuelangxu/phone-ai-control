@@ -2,6 +2,8 @@ package com.example.phoneaicontrol;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.AppOpsManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -23,6 +25,9 @@ import android.os.Environment;
 import android.provider.AlarmClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStats;
+import android.app.usage.UsageStatsManager;
 import android.util.Base64;
 import android.text.InputType;
 import android.view.Gravity;
@@ -52,7 +57,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -82,6 +89,8 @@ public class MainActivity extends Activity {
     private static final long AUTO_INSTALL_MIN_INTERVAL_MS = 2000L;
     private static final long AUTO_DEVICE_ACTION_MIN_INTERVAL_MS = 1500L;
     private static final long BATTERY_PUSH_MIN_INTERVAL_MS = 15000L;
+    private static final long USAGE_PUSH_MIN_INTERVAL_MS = 15000L;
+    private static final long DISCOVERY_RETRY_MIN_INTERVAL_MS = 3000L;
     private static final long PERIODIC_REFRESH_MS = 15000L;
     private static final String NOTIFICATION_CHANNEL_ID = "phone_ai_control_alerts";
 
@@ -101,6 +110,7 @@ public class MainActivity extends Activity {
     private String currentPendingApprovalId = "";
     private String pendingLocalApprovalJson = "";
     private boolean discoveryInFlight = false;
+    private long lastDiscoveryKickMs = 0L;
     private long lastAutoApprovalKickMs = 0L;
     private boolean autoApprovalRequestInFlight = false;
     private long lastAutoInstallKickMs = 0L;
@@ -109,6 +119,8 @@ public class MainActivity extends Activity {
     private boolean autoDeviceActionRequestInFlight = false;
     private long lastBatteryPushMs = 0L;
     private boolean batteryPushInFlight = false;
+    private long lastUsagePushMs = 0L;
+    private boolean usagePushInFlight = false;
     private final Runnable periodicRefreshRunnable = new Runnable() {
         @Override
         public void run() {
@@ -317,6 +329,7 @@ public class MainActivity extends Activity {
         Button copyButton = button("Copy Address");
         Button copyTokenButton = button("Copy Token (20s)");
         Button allFilesButton = button("Open All Files Access Settings");
+        Button usageAccessButton = button("Open Usage Access Settings");
         Button settingsButton = button("Open Phone AI Control Settings");
 
         startButton.setOnClickListener(new View.OnClickListener() {
@@ -367,6 +380,12 @@ public class MainActivity extends Activity {
                 openAllFilesAccessSettings();
             }
         });
+        usageAccessButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUsageAccessSettings();
+            }
+        });
 
         root.addView(startButton);
         root.addView(stopPublicButton);
@@ -375,6 +394,7 @@ public class MainActivity extends Activity {
         root.addView(copyButton);
         root.addView(copyTokenButton);
         root.addView(allFilesButton);
+        root.addView(usageAccessButton);
         root.addView(settingsButton);
         root.addView(detailText);
         root.addView(approvalText);
@@ -438,7 +458,6 @@ public class MainActivity extends Activity {
     }
 
     private void refreshStatus() {
-        setButtons(false);
         refreshPollingUi();
         statusText.setText("Local API\nChecking...");
         publicText.setText("Public Exposure\nChecking...");
@@ -450,6 +469,7 @@ public class MainActivity extends Activity {
             String details = "";
             String publicUrl = "";
             final boolean allFiles = hasAllFilesAccess();
+            final boolean usageAccess = hasUsageAccess();
             try {
                 String localApiBase = resolveLocalApiBase(2500);
                 JSONObject health = getJson(localApiBase + "/healthz", 2500);
@@ -462,7 +482,8 @@ public class MainActivity extends Activity {
                 details = "localtunnel: " + (lt ? "running" : "stopped")
                         + "\ncloudflared: " + (cf ? "running" : "stopped")
                         + "\nauth required: " + health.optBoolean("auth_required", true)
-                        + "\nall-files access: " + (allFiles ? "granted" : "not granted");
+                        + "\nall-files access: " + (allFiles ? "granted" : "not granted")
+                        + "\nusage access: " + (usageAccess ? "granted" : "not granted");
                 if (enabled && publicUrl.startsWith("https://")) {
                     publicStatus = "Enabled (tunnel running)";
                     try {
@@ -481,9 +502,12 @@ public class MainActivity extends Activity {
                 localStatus = "Offline";
                 details = "Local API check failed: " + e.getClass().getSimpleName() + ": " + e.getMessage()
                         + "\nall-files access: " + (allFiles ? "granted" : "not granted")
+                        + "\nusage access: " + (usageAccess ? "granted" : "not granted")
                         + "\nTap Start Public API to start Termux scripts.";
-                if (!discoveryInFlight && hasTermuxPermission()) {
+                long nowMs = System.currentTimeMillis();
+                if (!discoveryInFlight && hasTermuxPermission() && nowMs - lastDiscoveryKickMs >= DISCOVERY_RETRY_MIN_INTERVAL_MS) {
                     discoveryInFlight = true;
+                    lastDiscoveryKickMs = nowMs;
                     runManagedTermuxCommand(
                             "cat " + TERMUX_HOME + "/ai-phone-api/port.txt 2>/dev/null || true",
                             TokenResultService.ACTION_DISCOVER_LOCAL_API,
@@ -510,8 +534,8 @@ public class MainActivity extends Activity {
                     } else if ("Pending File Approval\nLocal API is offline.".contentEquals(approvalText.getText())) {
                         approvalText.setText("Pending File Approval\nAuto mode is enabled. Shared-storage file changes will be approved and executed automatically while Phone AI Control is open.");
                     }
-                    setButtons(true);
                     pushBatteryStatusIfNeeded();
+                    pushUsageSnapshotIfNeeded();
                     maybeAutoReviewPendingApprovals();
                     maybeAutoHandleInstallRequests();
                     maybeAutoHandleDeviceActions();
@@ -691,6 +715,7 @@ public class MainActivity extends Activity {
         if (!hasTermuxPermission()) {
             requestTermuxPermissionIfNeeded();
             Toast.makeText(this, "Termux command permission is required.", Toast.LENGTH_LONG).show();
+            setButtons(true);
             return;
         }
         try {
@@ -719,6 +744,7 @@ public class MainActivity extends Activity {
             }
         } catch (Exception e) {
             Toast.makeText(this, "Could not start Termux command: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            setButtons(true);
         }
     }
 
@@ -788,6 +814,7 @@ public class MainActivity extends Activity {
         if (!hasTermuxPermission()) {
             requestTermuxPermissionIfNeeded();
             Toast.makeText(this, "Termux command permission is required.", Toast.LENGTH_LONG).show();
+            setButtons(true);
             return;
         }
         try {
@@ -820,6 +847,7 @@ public class MainActivity extends Activity {
             }
         } catch (Exception e) {
             Toast.makeText(this, "Could not request approval action: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            setButtons(true);
         }
     }
 
@@ -936,9 +964,27 @@ public class MainActivity extends Activity {
             if (ok && !trimmedStdout.isEmpty()) {
                 String discovered = trimmedStdout.replaceAll("[^0-9]", "");
                 if (discovered.length() == 4) {
-                    currentLocalApiBase = "http://127.0.0.1:" + discovered;
-                    detailText.setText("Details\nDiscovered local API at " + currentLocalApiBase + " via Termux.");
-                    scheduleRefreshes(250);
+                    final String discoveredBase = "http://127.0.0.1:" + discovered;
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                JSONObject health = getJson(discoveredBase + "/healthz", 1200);
+                                if (!health.optBoolean("ok", false)) {
+                                    return;
+                                }
+                                runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        currentLocalApiBase = discoveredBase;
+                                        detailText.setText("Details\nDiscovered local API at " + currentLocalApiBase + " via Termux.");
+                                        scheduleRefreshes(250);
+                                    }
+                                });
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }).start();
                     return;
                 }
             }
@@ -957,6 +1003,7 @@ public class MainActivity extends Activity {
         if (!ok) {
             Toast.makeText(this, details.toString(), Toast.LENGTH_LONG).show();
         }
+        setButtons(true);
     }
 
     private boolean hasSharedStoragePermission() {
@@ -1534,6 +1581,32 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void openUsageAccessSettings() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open Usage Access settings: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private boolean hasUsageAccess() {
+        if (Build.VERSION.SDK_INT < 21) {
+            return false;
+        }
+        try {
+            AppOpsManager appOps = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
+            if (appOps == null) {
+                return false;
+            }
+            int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), getPackageName());
+            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     private void pushBatteryStatusIfNeeded() {
         long now = System.currentTimeMillis();
         if (batteryPushInFlight || now - lastBatteryPushMs < BATTERY_PUSH_MIN_INTERVAL_MS) {
@@ -1550,6 +1623,27 @@ public class MainActivity extends Activity {
                 } catch (Exception ignored) {
                 } finally {
                     batteryPushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private void pushUsageSnapshotIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (usagePushInFlight || now - lastUsagePushMs < USAGE_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        usagePushInFlight = true;
+        lastUsagePushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectUsageSnapshot();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/usage", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    usagePushInFlight = false;
                 }
             }
         }).start();
@@ -1582,6 +1676,93 @@ public class MainActivity extends Activity {
         return payload;
     }
 
+    private JSONObject collectUsageSnapshot() throws Exception {
+        JSONObject payload = new JSONObject();
+        payload.put("source", "phone_ai_control");
+        payload.put("captured_epoch_ms", System.currentTimeMillis());
+        payload.put("usage_access_granted", hasUsageAccess());
+
+        ActivityManager activityManager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        if (activityManager != null) {
+            ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
+            activityManager.getMemoryInfo(memoryInfo);
+            JSONObject memory = new JSONObject();
+            memory.put("avail_mem_bytes", memoryInfo.availMem);
+            memory.put("total_mem_bytes", memoryInfo.totalMem);
+            memory.put("threshold_bytes", memoryInfo.threshold);
+            memory.put("low_memory", memoryInfo.lowMemory);
+            payload.put("memory", memory);
+        }
+
+        if (!hasUsageAccess() || Build.VERSION.SDK_INT < 21) {
+            return payload;
+        }
+
+        UsageStatsManager usageStatsManager = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+        if (usageStatsManager == null) {
+            return payload;
+        }
+
+        long end = System.currentTimeMillis();
+        long start = end - (15L * 60L * 1000L);
+        UsageEvents events = usageStatsManager.queryEvents(start, end);
+        UsageEvents.Event event = new UsageEvents.Event();
+        String foregroundPackage = null;
+        String foregroundClass = null;
+        String foregroundEvent = null;
+        long foregroundAt = 0L;
+        while (events != null && events.hasNextEvent()) {
+            events.getNextEvent(event);
+            int type = event.getEventType();
+            boolean isForeground = type == UsageEvents.Event.MOVE_TO_FOREGROUND
+                    || (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_RESUMED);
+            if (!isForeground) {
+                continue;
+            }
+            foregroundPackage = event.getPackageName();
+            foregroundClass = event.getClassName();
+            foregroundEvent = usageEventLabel(type);
+            foregroundAt = event.getTimeStamp();
+        }
+        if (foregroundPackage != null && !foregroundPackage.isEmpty()) {
+            JSONObject foreground = new JSONObject();
+            foreground.put("package", foregroundPackage);
+            foreground.put("class", foregroundClass == null ? JSONObject.NULL : foregroundClass);
+            foreground.put("event", foregroundEvent == null ? JSONObject.NULL : foregroundEvent);
+            foreground.put("event_epoch_ms", foregroundAt);
+            payload.put("foreground", foreground);
+        }
+
+        List<UsageStats> stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, end);
+        if (stats != null && !stats.isEmpty()) {
+            Collections.sort(stats, new Comparator<UsageStats>() {
+                @Override
+                public int compare(UsageStats left, UsageStats right) {
+                    return Long.compare(right.getLastTimeUsed(), left.getLastTimeUsed());
+                }
+            });
+            JSONArray recent = new JSONArray();
+            int added = 0;
+            for (UsageStats stat : stats) {
+                if (stat == null || stat.getPackageName() == null || stat.getPackageName().isEmpty()) {
+                    continue;
+                }
+                JSONObject item = new JSONObject();
+                item.put("package", stat.getPackageName());
+                item.put("last_time_used_epoch_ms", stat.getLastTimeUsed());
+                item.put("total_time_in_foreground_ms", stat.getTotalTimeInForeground());
+                recent.put(item);
+                added++;
+                if (added >= 10) {
+                    break;
+                }
+            }
+            payload.put("recent_packages", recent);
+        }
+
+        return payload;
+    }
+
     private String batteryStatusLabel(int status) {
         switch (status) {
             case BatteryManager.BATTERY_STATUS_CHARGING:
@@ -1594,6 +1775,23 @@ public class MainActivity extends Activity {
                 return "not_charging";
             default:
                 return "unknown";
+        }
+    }
+
+    private String usageEventLabel(int type) {
+        switch (type) {
+            case UsageEvents.Event.MOVE_TO_FOREGROUND:
+                return "move_to_foreground";
+            case UsageEvents.Event.MOVE_TO_BACKGROUND:
+                return "move_to_background";
+            default:
+                if (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    return "activity_resumed";
+                }
+                if (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_PAUSED) {
+                    return "activity_paused";
+                }
+                return String.valueOf(type);
         }
     }
 
