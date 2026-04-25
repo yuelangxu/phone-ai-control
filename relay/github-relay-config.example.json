@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "api_base": "https://api.github.com",
+  "owner": "your-github-name-or-org",
+  "repo": "your-private-phone-relay-repo",
+  "branch": "main",
+  "contents_path": "relay/current_device.json",
+  "device_id": "phone-main",
+  "device_name": "My Phone",
+  "github_token_file": "/storage/emulated/0/Android/media/com.example.phoneaicontrol/github-relay-token.txt"
+}

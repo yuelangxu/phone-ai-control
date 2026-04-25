@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.phoneaicontrol"
-    android:versionCode="19"
-    android:versionName="1.0.19">
+    android:versionCode="22"
+    android:versionName="1.0.22">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
@@ -12,7 +12,10 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -40,9 +43,28 @@
         <service
             android:name=".AutomationLoopService"
             android:exported="false" />
+        <service
+            android:name=".PhoneAiNotificationListener"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
         <receiver
             android:name=".ClipboardClearReceiver"
             android:exported="false" />
+        <receiver
+            android:name=".RelayCommandReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.phoneaicontrol.action.SET_RELAY_MODE" />
+                <action android:name="com.example.phoneaicontrol.action.ENSURE_GITHUB_RELAY" />
+                <action android:name="com.example.phoneaicontrol.action.SYNC_GITHUB_RELAY" />
+            </intent-filter>
+        </receiver>
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"

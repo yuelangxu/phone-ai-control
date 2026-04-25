@@ -1,0 +1,83 @@
+name: Phone API GitHub Relay
+
+on:
+  issues:
+    types: [opened, edited, reopened, labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  relay:
+    if: |
+      (github.event_name == 'issues' && contains(join(github.event.issue.labels.*.name, ','), 'phone-relay')) ||
+      (github.event_name == 'issue_comment' && contains(join(github.event.issue.labels.*.name, ','), 'phone-relay') && contains(github.event.comment.body, '/phone-relay-run'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run phone API relay
+        env:
+          PHONE_API_PUBLIC_URL: ${{ secrets.PHONE_API_PUBLIC_URL }}
+          PHONE_API_BEARER_TOKEN: ${{ secrets.PHONE_API_BEARER_TOKEN }}
+          RELAY_RESULT_PATH: ${{ runner.temp }}/phone_api_relay_result.json
+        run: python relay/github_issue_relay.py
+
+      - name: Post result back to issue
+        uses: actions/github-script@v7
+        env:
+          RELAY_RESULT_PATH: ${{ runner.temp }}/phone_api_relay_result.json
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync(process.env.RELAY_RESULT_PATH, 'utf8'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.issue.number;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: result.comment_body
+            });
+
+            const labelsToAdd = [result.ok ? 'relay-completed' : 'relay-failed'];
+            for (const label of ['relay-pending', 'relay-completed', 'relay-failed']) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number,
+                  name: label
+                });
+              } catch (error) {
+                core.info(`Label ${label} was not present: ${error.message}`);
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number,
+              labels: labelsToAdd
+            });
+
+            if (result.close_issue) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number,
+                state: 'closed'
+              });
+            }

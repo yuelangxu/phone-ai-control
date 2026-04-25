@@ -26,6 +26,39 @@ The phone-side API can currently support these kinds of work:
 - Create and track file approval flows for shared-storage changes
 - Start or stop the public tunnel
 
+## Access Inventory
+
+This system has more access than plain Termux alone, because Phone AI Control can mediate some Android-side capabilities.
+
+Current practical access includes:
+
+- Local API access over phone-local loopback HTTP
+- Public API access through the current tunnel URL
+- Termux private files
+- API job artifacts and workspaces
+- Package install status and package APK path checks
+- Android-side battery and usage snapshots cached through Phone AI Control
+- Android-side actions such as notifications, alarms, timers, open-app requests, and install requests
+- Shared-storage mediation when Android permissions and approval flow allow it
+
+Important nuance:
+
+- Do not assume "plain Termux cannot do this" means "the whole phone stack cannot do this"
+- Some things are available only because Phone AI Control bridges Android-side access
+- Shared storage, photos, downloads, screenshots, and similar user files may be reachable through the mediated file workflow when permissions are present
+
+## Port Reality
+
+Do not assume the phone API is unavailable just because a fixed local port is not written in a document.
+
+The local phone API port may be dynamic.
+
+That means:
+
+- a missing hard-coded port in docs is not proof that the API is unavailable
+- the correct behavior is to prefer the configured Action server, runtime status, and health checks
+- if local discovery is needed, discovered ports should be validated with a health check instead of trusted blindly
+
 ## Important Limits
 
 This system is not root and is not a full device-admin tool.

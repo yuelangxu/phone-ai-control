@@ -15,3 +15,6 @@ token.txt
 tunnel-url.txt
 PHONE_AI_API_README.md
 TERMUX_AI_README.md
+relay/current_device.json
+__pycache__/
+*.pyc

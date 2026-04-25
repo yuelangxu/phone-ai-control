@@ -1,0 +1,7 @@
+{
+  "device_id": "phone-main",
+  "public_url": "https://replace-this-with-your-current-phone-tunnel.loca.lt",
+  "updated_at": "2026-04-25T00:00:00Z",
+  "healthy": true,
+  "notes": "Commit a real relay/current_device.json in your private repo, or set PHONE_API_PUBLIC_URL as a GitHub secret."
+}

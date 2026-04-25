@@ -3,6 +3,7 @@ package com.example.phoneaicontrol;
 import android.Manifest;
 import android.app.Activity;
 import android.app.ActivityManager;
+import android.app.AlarmManager;
 import android.app.AppOpsManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -16,13 +17,17 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.PowerManager;
+import android.provider.CallLog;
 import android.provider.AlarmClock;
+import android.provider.ContactsContract;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.app.usage.UsageEvents;
@@ -35,6 +40,7 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -79,6 +85,7 @@ public class MainActivity extends Activity {
     private static final int REQUEST_CONFIRM_CREDENTIAL = 43;
     private static final int REQUEST_STORAGE_PERMISSION = 44;
     private static final int REQUEST_ALL_FILES_ACCESS = 45;
+    private static final int REQUEST_CONTACTS_AND_CALL_LOG_PERMISSION = 46;
     private static final int TOKEN_CLEAR_AFTER_MS = 20_000;
     private static final long MAX_LOCAL_READ_BYTES = 4L * 1024 * 1024 * 1024;
     private static final int DIRECT_INLINE_READ_BYTES = 1 * 1024 * 1024;
@@ -90,8 +97,13 @@ public class MainActivity extends Activity {
     private static final long AUTO_DEVICE_ACTION_MIN_INTERVAL_MS = 1500L;
     private static final long BATTERY_PUSH_MIN_INTERVAL_MS = 15000L;
     private static final long USAGE_PUSH_MIN_INTERVAL_MS = 15000L;
+    private static final long NOTIFICATION_PUSH_MIN_INTERVAL_MS = 10000L;
+    private static final long CONTACTS_PUSH_MIN_INTERVAL_MS = 60000L;
+    private static final long MISSED_CALLS_PUSH_MIN_INTERVAL_MS = 30000L;
     private static final long DISCOVERY_RETRY_MIN_INTERVAL_MS = 3000L;
     private static final long PERIODIC_REFRESH_MS = 15000L;
+    private static final long PUBLIC_RECONNECT_MIN_INTERVAL_MS = 45000L;
+    private static final int PUBLIC_PROBE_TIMEOUT_MS = 5000;
     private static final String NOTIFICATION_CHANNEL_ID = "phone_ai_control_alerts";
 
     private TextView statusText;
@@ -100,11 +112,15 @@ public class MainActivity extends Activity {
     private TextView detailText;
     private TextView approvalText;
     private TextView pollingText;
+    private TextView modeText;
     private EditText pollIntervalInput;
+    private SeekBar modeSeekBar;
     private Button startButton;
     private Button stopPublicButton;
     private Button stopAllButton;
     private Button applyPollingButton;
+    private Button githubRepoButton;
+    private Button copyGithubTokenButton;
     private String currentPublicUrl = "";
     private String currentLocalApiBase = DEFAULT_LOCAL_API;
     private String currentPendingApprovalId = "";
@@ -121,6 +137,13 @@ public class MainActivity extends Activity {
     private boolean batteryPushInFlight = false;
     private long lastUsagePushMs = 0L;
     private boolean usagePushInFlight = false;
+    private long lastNotificationPushMs = 0L;
+    private boolean notificationPushInFlight = false;
+    private long lastContactsPushMs = 0L;
+    private boolean contactsPushInFlight = false;
+    private long lastMissedCallsPushMs = 0L;
+    private boolean missedCallsPushInFlight = false;
+    private long lastPublicReconnectKickMs = 0L;
     private final Runnable periodicRefreshRunnable = new Runnable() {
         @Override
         public void run() {
@@ -130,6 +153,22 @@ public class MainActivity extends Activity {
             }
         }
     };
+
+    private static final class PublicTunnelProbeResult {
+        final boolean reachable;
+        final int statusCode;
+        final String detail;
+
+        PublicTunnelProbeResult(boolean reachable, int statusCode, String detail) {
+            this.reachable = reachable;
+            this.statusCode = statusCode;
+            this.detail = detail == null ? "" : detail;
+        }
+
+        boolean shouldReconnect() {
+            return !reachable && (statusCode < 0 || statusCode >= 400);
+        }
+    }
 
     private final BroadcastReceiver approvalReceiver = new BroadcastReceiver() {
         @Override
@@ -230,6 +269,25 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode != REQUEST_STORAGE_PERMISSION) {
+            if (requestCode == REQUEST_CONTACTS_AND_CALL_LOG_PERMISSION) {
+                boolean granted = true;
+                if (grantResults.length == 0) {
+                    granted = false;
+                } else {
+                    for (int grantResult : grantResults) {
+                        if (grantResult != PackageManager.PERMISSION_GRANTED) {
+                            granted = false;
+                            break;
+                        }
+                    }
+                }
+                Toast.makeText(this, granted ? "Contacts and call log access granted." : "Contacts or call log access was denied.", Toast.LENGTH_SHORT).show();
+                if (granted) {
+                    pushContactsSnapshotIfNeeded();
+                    pushMissedCallsSnapshotIfNeeded();
+                }
+                refreshStatus();
+            }
             return;
         }
         boolean granted = true;
@@ -275,12 +333,41 @@ public class MainActivity extends Activity {
         statusText = card("Local API", "Checking...");
         addressText = card("Current Public Address", "Unknown");
         publicText = card("Public Exposure", "Checking...");
+        modeText = card("Relay Mode", "Traditional direct mode");
         detailText = card("Details", "No data yet.");
         pollingText = card("Background Polling", "Checking...");
         approvalText = card("Pending File Approval", "Auto mode is enabled. Shared-storage file changes will be approved and executed automatically while Phone AI Control is open.");
         root.addView(statusText);
         root.addView(addressText);
         root.addView(publicText);
+        root.addView(modeText);
+        TextView modeLabels = text("Traditional direct  <->  GitHub relay", 13, Color.rgb(110, 118, 114), false);
+        modeLabels.setPadding(0, dp(6), 0, 0);
+        root.addView(modeLabels);
+        modeSeekBar = new SeekBar(this);
+        modeSeekBar.setMax(1);
+        LinearLayout.LayoutParams modeSeekParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        modeSeekParams.setMargins(0, dp(2), 0, 0);
+        modeSeekBar.setLayoutParams(modeSeekParams);
+        modeSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                applyRelayMode(seekBar.getProgress() >= 1
+                        ? AutomationSettings.RELAY_MODE_GITHUB
+                        : AutomationSettings.RELAY_MODE_TRADITIONAL);
+            }
+        });
+        root.addView(modeSeekBar);
         root.addView(pollingText);
 
         LinearLayout pollRow = new LinearLayout(this);
@@ -328,8 +415,14 @@ public class MainActivity extends Activity {
         Button refreshButton = button("Refresh Status");
         Button copyButton = button("Copy Address");
         Button copyTokenButton = button("Copy Token (20s)");
+        copyGithubTokenButton = button("Copy GitHub Token (20s)");
+        githubRepoButton = button("Check / Create GitHub Relay Repo");
         Button allFilesButton = button("Open All Files Access Settings");
         Button usageAccessButton = button("Open Usage Access Settings");
+        Button notificationAccessButton = button("Open Notification Access Settings");
+        Button contactsCallLogButton = button("Grant Contacts And Call Log Access");
+        Button batteryOptimizationButton = button("Request Battery Optimization Exemption");
+        Button unknownSourcesButton = button("Open Install Unknown Apps Settings");
         Button settingsButton = button("Open Phone AI Control Settings");
 
         startButton.setOnClickListener(new View.OnClickListener() {
@@ -368,6 +461,18 @@ public class MainActivity extends Activity {
                 copyToken();
             }
         });
+        copyGithubTokenButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyGitHubToken();
+            }
+        });
+        githubRepoButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                checkOrCreateGitHubRelayRepo();
+            }
+        });
         settingsButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -386,6 +491,30 @@ public class MainActivity extends Activity {
                 openUsageAccessSettings();
             }
         });
+        notificationAccessButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openNotificationAccessSettings();
+            }
+        });
+        contactsCallLogButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                requestContactsAndCallLogPermissions();
+            }
+        });
+        batteryOptimizationButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                requestIgnoreBatteryOptimizations();
+            }
+        });
+        unknownSourcesButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUnknownAppSourcesSettings();
+            }
+        });
 
         root.addView(startButton);
         root.addView(stopPublicButton);
@@ -393,8 +522,14 @@ public class MainActivity extends Activity {
         root.addView(refreshButton);
         root.addView(copyButton);
         root.addView(copyTokenButton);
+        root.addView(copyGithubTokenButton);
+        root.addView(githubRepoButton);
         root.addView(allFilesButton);
         root.addView(usageAccessButton);
+        root.addView(notificationAccessButton);
+        root.addView(contactsCallLogButton);
+        root.addView(batteryOptimizationButton);
+        root.addView(unknownSourcesButton);
         root.addView(settingsButton);
         root.addView(detailText);
         root.addView(approvalText);
@@ -417,6 +552,7 @@ public class MainActivity extends Activity {
 
         setContentView(scroll);
         refreshPollingUi();
+        refreshRelayModeUi();
     }
 
     private TextView text(String value, int sp, int color, boolean bold) {
@@ -468,13 +604,30 @@ public class MainActivity extends Activity {
             String publicStatus = "Disabled or unknown";
             String details = "";
             String publicUrl = "";
+            boolean shouldReconnectPublicTunnel = false;
+            String reconnectReason = "";
             final boolean allFiles = hasAllFilesAccess();
             final boolean usageAccess = hasUsageAccess();
+            final boolean notificationAccess = hasNotificationAccess();
+            final boolean batteryOptimizationIgnored = isIgnoringBatteryOptimizations();
+            final boolean installUnknownAppsAllowed = canRequestPackageInstallsCompat();
+            final boolean contactsAccess = hasContactsAccess();
+            final boolean callLogAccess = hasCallLogAccess();
+            final boolean githubRelayMode = AutomationSettings.isGitHubRelayMode(MainActivity.this);
+            JSONObject permissionState = collectPermissionState();
+            String syncLocalApiBase = currentLocalApiBase;
+            boolean syncLocalApiOk = false;
+            String syncPublicProbeDetail = "";
+            boolean syncPublicReachable = false;
+            JSONObject syncHealth = null;
             try {
                 String localApiBase = resolveLocalApiBase(2500);
                 JSONObject health = getJson(localApiBase + "/healthz", 2500);
                 localStatus = health.optBoolean("ok") ? "Online" : "Unexpected response";
                 currentLocalApiBase = localApiBase;
+                syncLocalApiBase = localApiBase;
+                syncLocalApiOk = "Online".equals(localStatus);
+                syncHealth = health;
                 publicUrl = normalizePublicUrl(health.optString("public_url", ""));
                 boolean enabled = health.optBoolean("public_enabled", false);
                 boolean lt = health.optBoolean("localtunnel_running", false);
@@ -483,26 +636,47 @@ public class MainActivity extends Activity {
                         + "\ncloudflared: " + (cf ? "running" : "stopped")
                         + "\nauth required: " + health.optBoolean("auth_required", true)
                         + "\nall-files access: " + (allFiles ? "granted" : "not granted")
-                        + "\nusage access: " + (usageAccess ? "granted" : "not granted");
+                        + "\nusage access: " + (usageAccess ? "granted" : "not granted")
+                        + "\nnotification access: " + (notificationAccess ? "granted" : "not granted")
+                        + "\ncontacts access: " + (contactsAccess ? "granted" : "not granted")
+                        + "\ncall log access: " + (callLogAccess ? "granted" : "not granted")
+                        + "\nbattery optimization exemption: " + (batteryOptimizationIgnored ? "granted" : "not granted")
+                        + "\ninstall unknown apps: " + (installUnknownAppsAllowed ? "granted" : "not granted");
                 if (enabled && publicUrl.startsWith("https://")) {
                     publicStatus = "Enabled (tunnel running)";
-                    try {
-                        JSONObject publicHealth = getJson(publicUrl + "/healthz", 5000);
-                        publicStatus = publicHealth.optBoolean("ok") ? "Enabled and reachable" : "Enabled, but health check failed";
-                    } catch (Exception e) {
-                        publicStatus = "Enabled (tunnel running)";
-                        details += "\npublic self-check pending: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                    PublicTunnelProbeResult probe = probePublicTunnel(publicUrl, PUBLIC_PROBE_TIMEOUT_MS);
+                    syncPublicReachable = probe.reachable;
+                    syncPublicProbeDetail = probe.detail;
+                    if (probe.reachable) {
+                        publicStatus = "Enabled and reachable";
+                    } else {
+                        publicStatus = "Enabled, but tunnel is unavailable";
+                        details += "\npublic self-check failed: " + probe.detail;
+                        if (probe.shouldReconnect()) {
+                            shouldReconnectPublicTunnel = true;
+                            reconnectReason = probe.detail;
+                        }
                     }
                 } else if ((lt || cf) && publicUrl.isEmpty()) {
                     publicStatus = "Starting tunnel...";
                 } else {
                     publicStatus = "Off";
+                    syncPublicReachable = false;
+                    syncPublicProbeDetail = enabled ? "Public URL missing while tunnel reports enabled." : "Public exposure disabled.";
                 }
             } catch (Exception e) {
                 localStatus = "Offline";
+                syncLocalApiOk = false;
+                syncPublicReachable = false;
+                syncPublicProbeDetail = e.getClass().getSimpleName() + ": " + e.getMessage();
                 details = "Local API check failed: " + e.getClass().getSimpleName() + ": " + e.getMessage()
                         + "\nall-files access: " + (allFiles ? "granted" : "not granted")
                         + "\nusage access: " + (usageAccess ? "granted" : "not granted")
+                        + "\nnotification access: " + (notificationAccess ? "granted" : "not granted")
+                        + "\ncontacts access: " + (contactsAccess ? "granted" : "not granted")
+                        + "\ncall log access: " + (callLogAccess ? "granted" : "not granted")
+                        + "\nbattery optimization exemption: " + (batteryOptimizationIgnored ? "granted" : "not granted")
+                        + "\ninstall unknown apps: " + (installUnknownAppsAllowed ? "granted" : "not granted")
                         + "\nTap Start Public API to start Termux scripts.";
                 long nowMs = System.currentTimeMillis();
                 if (!discoveryInFlight && hasTermuxPermission() && nowMs - lastDiscoveryKickMs >= DISCOVERY_RETRY_MIN_INTERVAL_MS) {
@@ -515,10 +689,41 @@ public class MainActivity extends Activity {
                     );
                 }
             }
+            if (githubRelayMode) {
+                try {
+                    JSONObject relayState = GitHubRelaySync.buildDeviceState(
+                            MainActivity.this,
+                            "main_activity",
+                            syncLocalApiBase,
+                            syncLocalApiOk,
+                            localStatus,
+                            syncHealth,
+                            syncPublicReachable,
+                            syncPublicProbeDetail,
+                            permissionState
+                    );
+                    GitHubRelaySync.maybeSyncCurrentDevice(MainActivity.this, relayState, false);
+                } catch (Exception ignored) {
+                }
+                String githubSummary = GitHubRelaySync.describeForUi(MainActivity.this);
+                if (!githubSummary.isEmpty()) {
+                    if (!details.isEmpty()) {
+                        details += "\n";
+                    }
+                    details += githubSummary;
+                }
+            } else {
+                if (!details.isEmpty()) {
+                    details += "\n";
+                }
+                details += "relay mode: traditional direct";
+            }
             String finalLocalStatus = localStatus;
             String finalPublicStatus = publicStatus;
             String finalDetails = details;
             String finalPublicUrl = publicUrl;
+            final boolean finalShouldReconnectPublicTunnel = shouldReconnectPublicTunnel;
+            final String finalReconnectReason = reconnectReason;
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
@@ -528,14 +733,33 @@ public class MainActivity extends Activity {
                     publicText.setText("Public Exposure\n" + finalPublicStatus);
                     detailText.setText("Details\n" + finalDetails);
                     refreshPollingUi();
+                    refreshRelayModeUi();
                     if (!"Online".equals(finalLocalStatus)) {
                         currentPendingApprovalId = "";
                         approvalText.setText("Pending File Approval\nLocal API is offline.");
                     } else if ("Pending File Approval\nLocal API is offline.".contentEquals(approvalText.getText())) {
                         approvalText.setText("Pending File Approval\nAuto mode is enabled. Shared-storage file changes will be approved and executed automatically while Phone AI Control is open.");
                     }
+                    if ("Online".equals(finalLocalStatus)
+                            && finalShouldReconnectPublicTunnel
+                            && requestPublicTunnelReconnectSilently(finalReconnectReason)) {
+                        String reconnectDetails = detailText.getText() == null
+                                ? ""
+                                : detailText.getText().toString().replaceFirst("^Details\\n", "");
+                        if (!reconnectDetails.isEmpty()) {
+                            reconnectDetails += "\n";
+                        }
+                        reconnectDetails += "auto-reconnect requested after public tunnel failure: " + finalReconnectReason;
+                        currentPublicUrl = "";
+                        publicText.setText("Public Exposure\nEnabled, but tunnel was unhealthy - reconnecting...");
+                        addressText.setText("Current Public Address\nRefreshing tunnel...");
+                        detailText.setText("Details\n" + reconnectDetails);
+                    }
                     pushBatteryStatusIfNeeded();
                     pushUsageSnapshotIfNeeded();
+                    pushNotificationsSnapshotIfNeeded();
+                    pushContactsSnapshotIfNeeded();
+                    pushMissedCallsSnapshotIfNeeded();
                     maybeAutoReviewPendingApprovals();
                     maybeAutoHandleInstallRequests();
                     maybeAutoHandleDeviceActions();
@@ -543,6 +767,52 @@ public class MainActivity extends Activity {
             });
             }
         }).start();
+    }
+
+    private PublicTunnelProbeResult probePublicTunnel(String publicUrl, int timeoutMs) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(publicUrl + "/healthz").openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
+            conn.setRequestProperty("User-Agent", "PhoneAIControl/1.0");
+            conn.setRequestProperty("bypass-tunnel-reminder", "1");
+            int code = conn.getResponseCode();
+            InputStream stream = code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream();
+            String body = "";
+            if (stream != null) {
+                body = new String(readStreamFully(stream), StandardCharsets.UTF_8).trim();
+            }
+            if (code == 200) {
+                try {
+                    JSONObject payload = new JSONObject(body);
+                    if (payload.optBoolean("ok", true)) {
+                        return new PublicTunnelProbeResult(true, code, "HTTP 200");
+                    }
+                } catch (Exception ignored) {
+                    return new PublicTunnelProbeResult(true, code, "HTTP 200");
+                }
+            }
+            return new PublicTunnelProbeResult(false, code, summarizeProbeFailure(code, body));
+        } catch (Exception e) {
+            return new PublicTunnelProbeResult(false, -1, e.getClass().getSimpleName() + ": " + e.getMessage());
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private String summarizeProbeFailure(int statusCode, String body) {
+        String normalized = body == null ? "" : body.replace('\n', ' ').replace('\r', ' ').trim();
+        if (normalized.length() > 160) {
+            normalized = normalized.substring(0, 160) + "...";
+        }
+        if (normalized.isEmpty()) {
+            return "HTTP " + statusCode;
+        }
+        return "HTTP " + statusCode + ": " + normalized;
     }
 
     private JSONObject getJson(String rawUrl, int timeoutMs) throws Exception {
@@ -619,6 +889,7 @@ public class MainActivity extends Activity {
     }
 
     private void startOrRestartPublicApi() {
+        lastPublicReconnectKickMs = System.currentTimeMillis();
         setButtons(false);
         detailText.setText("Details\nChecking whether the local API is already online...");
         new Thread(new Runnable() {
@@ -810,12 +1081,12 @@ public class MainActivity extends Activity {
         );
     }
 
-    private void requestTokenBackedAction(String actionName, String approvalId, String toast) {
+    private boolean requestTokenBackedAction(String actionName, String approvalId, String toast) {
         if (!hasTermuxPermission()) {
             requestTermuxPermissionIfNeeded();
             Toast.makeText(this, "Termux command permission is required.", Toast.LENGTH_LONG).show();
             setButtons(true);
-            return;
+            return false;
         }
         try {
             Intent resultIntent = new Intent(this, TokenResultService.class);
@@ -845,10 +1116,32 @@ public class MainActivity extends Activity {
             if (toast != null && !toast.trim().isEmpty()) {
                 Toast.makeText(this, toast, Toast.LENGTH_LONG).show();
             }
+            return true;
         } catch (Exception e) {
             Toast.makeText(this, "Could not request approval action: " + e.getMessage(), Toast.LENGTH_LONG).show();
             setButtons(true);
+            return false;
         }
+    }
+
+    private boolean requestPublicTunnelReconnectSilently(String reason) {
+        long now = System.currentTimeMillis();
+        if (!hasTermuxPermission()) {
+            return false;
+        }
+        if (now - lastPublicReconnectKickMs < PUBLIC_RECONNECT_MIN_INTERVAL_MS) {
+            return false;
+        }
+        lastPublicReconnectKickMs = now;
+        boolean started = requestTokenBackedAction(
+                TokenResultService.ACTION_CONTROL_START_PUBLIC,
+                null,
+                null
+        );
+        if (!started) {
+            lastPublicReconnectKickMs = 0L;
+        }
+        return started;
     }
 
     private void startApprovalChallenge() {
@@ -1331,6 +1624,24 @@ public class MainActivity extends Activity {
         }
     }
 
+    private byte[] readStreamFully(InputStream input) throws Exception {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try {
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = input.read(chunk)) >= 0) {
+                if (read == 0) {
+                    continue;
+                }
+                buffer.write(chunk, 0, read);
+            }
+            return buffer.toByteArray();
+        } finally {
+            input.close();
+            buffer.close();
+        }
+    }
+
     private JSONObject readLargeFileInChunks(JSONObject approval, File target, long totalBytes) throws Exception {
         String approvalId = approval.optString("id", "");
         String executionToken = approval.optString("execution_token", "");
@@ -1476,6 +1787,39 @@ public class MainActivity extends Activity {
         pollIntervalInput.setSelection(pollIntervalInput.getText().length());
     }
 
+    private void refreshRelayModeUi() {
+        int mode = AutomationSettings.getRelayMode(this);
+        if (modeText != null) {
+            if (mode == AutomationSettings.RELAY_MODE_GITHUB) {
+                modeText.setText("Relay Mode\nGitHub relay mode\nPhone AI Control will sync device state to your configured private GitHub relay repo.");
+            } else {
+                modeText.setText("Relay Mode\nTraditional direct mode\nCustom GPT should talk to the phone tunnel directly.");
+            }
+        }
+        if (modeSeekBar != null && modeSeekBar.getProgress() != mode) {
+            modeSeekBar.setProgress(mode);
+        }
+        if (githubRepoButton != null) {
+            githubRepoButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
+        }
+        if (copyGithubTokenButton != null) {
+            copyGithubTokenButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
+        }
+    }
+
+    private void applyRelayMode(int mode) {
+        int normalized = AutomationSettings.normalizeRelayMode(mode);
+        AutomationSettings.setRelayMode(this, normalized);
+        refreshRelayModeUi();
+        if (normalized == AutomationSettings.RELAY_MODE_GITHUB) {
+            Toast.makeText(this, "Switched to GitHub relay mode.", Toast.LENGTH_SHORT).show();
+            checkOrCreateGitHubRelayRepo();
+        } else {
+            Toast.makeText(this, "Switched to traditional direct mode.", Toast.LENGTH_SHORT).show();
+            refreshStatus();
+        }
+    }
+
     private void applyPollingInterval() {
         String raw = pollIntervalInput == null || pollIntervalInput.getText() == null
                 ? ""
@@ -1504,6 +1848,39 @@ public class MainActivity extends Activity {
         refreshPollingUi();
     }
 
+    private void checkOrCreateGitHubRelayRepo() {
+        if (!AutomationSettings.isGitHubRelayMode(this)) {
+            Toast.makeText(this, "Switch to GitHub relay mode first.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final JSONObject state = GitHubRelaySync.ensureRelayRepository(MainActivity.this, true);
+                final String summary = GitHubRelaySync.describeForUi(MainActivity.this);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        String current = detailText.getText() == null ? "" : detailText.getText().toString().replaceFirst("^Details\\n", "");
+                        String next = summary;
+                        if (!current.isEmpty()) {
+                            next = current + "\n" + summary;
+                        }
+                        detailText.setText("Details\n" + next);
+                        Toast.makeText(
+                                MainActivity.this,
+                                state.optBoolean("last_ok", false)
+                                        ? state.optString("last_message", "GitHub relay repo is ready.")
+                                        : state.optString("last_message", "GitHub relay repo check failed."),
+                                Toast.LENGTH_LONG
+                        ).show();
+                        refreshStatus();
+                    }
+                });
+            }
+        }).start();
+    }
+
     private void restartUiRefreshLoopIfNeeded() {
         if (statusText == null) {
             return;
@@ -1528,13 +1905,67 @@ public class MainActivity extends Activity {
     }
 
     private void copyAddress() {
-        if (currentPublicUrl == null || currentPublicUrl.isEmpty()) {
-            Toast.makeText(this, "No public address available.", Toast.LENGTH_SHORT).show();
+        String value = currentPublicUrl == null ? "" : currentPublicUrl.trim();
+        if (value.isEmpty() && AutomationSettings.isGitHubRelayMode(this)) {
+            value = GitHubRelaySync.getConfiguredRepoUrl(this);
+        }
+        if (value == null || value.isEmpty()) {
+            Toast.makeText(this, "No URL is available yet.", Toast.LENGTH_SHORT).show();
             return;
         }
+        String label = AutomationSettings.isGitHubRelayMode(this) && currentPublicUrl != null && currentPublicUrl.trim().isEmpty()
+                ? "GitHub Relay Repo URL"
+                : "Phone AI API URL";
+        copyTextToClipboard(label, value, false);
+    }
+
+    private void copyGitHubToken() {
+        if (!AutomationSettings.isGitHubRelayMode(this)) {
+            Toast.makeText(this, "GitHub token copy is only available in GitHub relay mode.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String token = GitHubRelaySync.loadGitHubTokenForCopy(this);
+        if (token == null || token.trim().isEmpty()) {
+            Toast.makeText(this, "No GitHub token is configured yet.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        copyTextToClipboard("GitHub Relay Token", token.trim(), true);
+    }
+
+    private void copyTextToClipboard(String label, String value, boolean autoClear) {
         ClipboardManager manager = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        manager.setPrimaryClip(ClipData.newPlainText("Phone AI API URL", currentPublicUrl));
-        Toast.makeText(this, "Address copied.", Toast.LENGTH_SHORT).show();
+        if (manager == null) {
+            Toast.makeText(this, "Clipboard is unavailable.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        manager.setPrimaryClip(ClipData.newPlainText(label, value));
+        if (autoClear) {
+            scheduleClipboardClear(value, TOKEN_CLEAR_AFTER_MS);
+            Toast.makeText(this, label + " copied. Clipboard will auto-clear in 20 seconds.", Toast.LENGTH_LONG).show();
+        } else {
+            Toast.makeText(this, label + " copied.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void scheduleClipboardClear(String text, int delayMs) {
+        Intent clearIntent = new Intent(this, ClipboardClearReceiver.class);
+        clearIntent.putExtra(ClipboardClearReceiver.EXTRA_TOKEN_SHA256, ClipboardClearReceiver.sha256(text));
+        PendingIntent pendingIntent = PendingIntent.getBroadcast(
+                this,
+                7002,
+                clearIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0)
+        );
+        AlarmManager alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        if (alarmManager == null) {
+            return;
+        }
+        long triggerAtMillis = System.currentTimeMillis() + Math.max(delayMs, 5_000);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, pendingIntent);
+        } else {
+            alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAtMillis, pendingIntent);
+        }
     }
 
     private void ensureNotificationChannel() {
@@ -1576,6 +2007,15 @@ public class MainActivity extends Activity {
         if (applyPollingButton != null) {
             applyPollingButton.setEnabled(enabled);
         }
+        if (githubRepoButton != null) {
+            githubRepoButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+        }
+        if (copyGithubTokenButton != null) {
+            copyGithubTokenButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+        }
+        if (modeSeekBar != null) {
+            modeSeekBar.setEnabled(enabled);
+        }
         if (pollIntervalInput != null) {
             pollIntervalInput.setEnabled(enabled);
         }
@@ -1591,6 +2031,58 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void openNotificationAccessSettings() {
+        try {
+            Intent intent = new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS");
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open Notification Access settings: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void requestIgnoreBatteryOptimizations() {
+        try {
+            Intent intent;
+            if (isIgnoringBatteryOptimizations()) {
+                intent = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+            } else {
+                intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(Uri.parse("package:" + getPackageName()));
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open battery optimization settings: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void openUnknownAppSourcesSettings() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open install-unknown-apps settings: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void requestContactsAndCallLogPermissions() {
+        if (Build.VERSION.SDK_INT < 23) {
+            refreshStatus();
+            return;
+        }
+        if (hasContactsAccess() && hasCallLogAccess()) {
+            Toast.makeText(this, "Contacts and call log access already granted.", Toast.LENGTH_SHORT).show();
+            refreshStatus();
+            return;
+        }
+        requestPermissions(
+                new String[]{Manifest.permission.READ_CONTACTS, Manifest.permission.READ_CALL_LOG},
+                REQUEST_CONTACTS_AND_CALL_LOG_PERMISSION
+        );
+    }
+
     private boolean hasUsageAccess() {
         if (Build.VERSION.SDK_INT < 21) {
             return false;
@@ -1602,6 +2094,44 @@ public class MainActivity extends Activity {
             }
             int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), getPackageName());
             return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean hasNotificationAccess() {
+        return NotificationAccessStore.hasNotificationAccess(this);
+    }
+
+    private boolean hasContactsAccess() {
+        if (Build.VERSION.SDK_INT < 23) {
+            return true;
+        }
+        return checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean hasCallLogAccess() {
+        if (Build.VERSION.SDK_INT < 23) {
+            return true;
+        }
+        return checkSelfPermission(Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean isIgnoringBatteryOptimizations() {
+        try {
+            PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            return powerManager != null && powerManager.isIgnoringBatteryOptimizations(getPackageName());
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean canRequestPackageInstallsCompat() {
+        try {
+            if (Build.VERSION.SDK_INT < 26) {
+                return true;
+            }
+            return getPackageManager().canRequestPackageInstalls();
         } catch (Exception ignored) {
             return false;
         }
@@ -1649,6 +2179,69 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    private void pushNotificationsSnapshotIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (notificationPushInFlight || now - lastNotificationPushMs < NOTIFICATION_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        notificationPushInFlight = true;
+        lastNotificationPushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectNotificationsSnapshot();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/notifications", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    notificationPushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private void pushContactsSnapshotIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (contactsPushInFlight || now - lastContactsPushMs < CONTACTS_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        contactsPushInFlight = true;
+        lastContactsPushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectContactsSnapshot();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/contacts", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    contactsPushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private void pushMissedCallsSnapshotIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (missedCallsPushInFlight || now - lastMissedCallsPushMs < MISSED_CALLS_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        missedCallsPushInFlight = true;
+        lastMissedCallsPushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectMissedCallsSnapshot();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/missed-calls", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    missedCallsPushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
     private JSONObject collectBatteryStatus() throws Exception {
         Intent batteryIntent = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         if (batteryIntent == null) {
@@ -1681,6 +2274,7 @@ public class MainActivity extends Activity {
         payload.put("source", "phone_ai_control");
         payload.put("captured_epoch_ms", System.currentTimeMillis());
         payload.put("usage_access_granted", hasUsageAccess());
+        payload.put("permission_state", collectPermissionState());
 
         ActivityManager activityManager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
         if (activityManager != null) {
@@ -1761,6 +2355,138 @@ public class MainActivity extends Activity {
         }
 
         return payload;
+    }
+
+    private JSONObject collectNotificationsSnapshot() {
+        JSONObject payload = NotificationAccessStore.exportSnapshot(this);
+        try {
+            payload.put("source", "phone_ai_control");
+            payload.put("captured_epoch_ms", System.currentTimeMillis());
+            payload.put("permission_state", collectPermissionState());
+        } catch (Exception ignored) {
+        }
+        return payload;
+    }
+
+    private JSONObject collectContactsSnapshot() {
+        JSONObject payload = new JSONObject();
+        try {
+            payload.put("source", "phone_ai_control");
+            payload.put("captured_epoch_ms", System.currentTimeMillis());
+            payload.put("contacts_access_granted", hasContactsAccess());
+            payload.put("permission_state", collectPermissionState());
+            JSONArray contacts = new JSONArray();
+            int total = 0;
+            if (hasContactsAccess()) {
+                Cursor cursor = getContentResolver().query(
+                        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                        new String[]{
+                                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                                ContactsContract.CommonDataKinds.Phone.NUMBER,
+                                ContactsContract.CommonDataKinds.Phone.STARRED
+                        },
+                        null,
+                        null,
+                        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE ASC"
+                );
+                if (cursor != null) {
+                    try {
+                        int displayNameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME);
+                        int numberIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER);
+                        int starredIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.STARRED);
+                        while (cursor.moveToNext()) {
+                            total++;
+                            if (contacts.length() >= 200) {
+                                continue;
+                            }
+                            JSONObject item = new JSONObject();
+                            item.put("display_name", displayNameIdx >= 0 ? emptyToNull(cursor.getString(displayNameIdx)) : JSONObject.NULL);
+                            item.put("number", numberIdx >= 0 ? emptyToNull(cursor.getString(numberIdx)) : JSONObject.NULL);
+                            item.put("starred", starredIdx >= 0 && cursor.getInt(starredIdx) != 0);
+                            contacts.put(item);
+                        }
+                    } finally {
+                        cursor.close();
+                    }
+                }
+            }
+            payload.put("count_total", total);
+            payload.put("contacts", contacts);
+        } catch (Exception ignored) {
+        }
+        return payload;
+    }
+
+    private JSONObject collectMissedCallsSnapshot() {
+        JSONObject payload = new JSONObject();
+        try {
+            payload.put("source", "phone_ai_control");
+            payload.put("captured_epoch_ms", System.currentTimeMillis());
+            payload.put("call_log_access_granted", hasCallLogAccess());
+            payload.put("permission_state", collectPermissionState());
+            JSONArray calls = new JSONArray();
+            int total = 0;
+            if (hasCallLogAccess()) {
+                Cursor cursor = getContentResolver().query(
+                        CallLog.Calls.CONTENT_URI,
+                        new String[]{
+                                CallLog.Calls.NUMBER,
+                                CallLog.Calls.CACHED_NAME,
+                                CallLog.Calls.DATE,
+                                CallLog.Calls.DURATION,
+                                CallLog.Calls.IS_READ,
+                                CallLog.Calls.TYPE
+                        },
+                        CallLog.Calls.TYPE + "=?",
+                        new String[]{String.valueOf(CallLog.Calls.MISSED_TYPE)},
+                        CallLog.Calls.DATE + " DESC"
+                );
+                if (cursor != null) {
+                    try {
+                        int numberIdx = cursor.getColumnIndex(CallLog.Calls.NUMBER);
+                        int nameIdx = cursor.getColumnIndex(CallLog.Calls.CACHED_NAME);
+                        int dateIdx = cursor.getColumnIndex(CallLog.Calls.DATE);
+                        int durationIdx = cursor.getColumnIndex(CallLog.Calls.DURATION);
+                        int isReadIdx = cursor.getColumnIndex(CallLog.Calls.IS_READ);
+                        while (cursor.moveToNext()) {
+                            total++;
+                            if (calls.length() >= 50) {
+                                continue;
+                            }
+                            JSONObject item = new JSONObject();
+                            item.put("number", numberIdx >= 0 ? emptyToNull(cursor.getString(numberIdx)) : JSONObject.NULL);
+                            item.put("cached_name", nameIdx >= 0 ? emptyToNull(cursor.getString(nameIdx)) : JSONObject.NULL);
+                            item.put("date_epoch_ms", dateIdx >= 0 ? cursor.getLong(dateIdx) : 0L);
+                            item.put("duration_sec", durationIdx >= 0 ? cursor.getLong(durationIdx) : 0L);
+                            item.put("is_read", isReadIdx >= 0 && cursor.getInt(isReadIdx) != 0);
+                            calls.put(item);
+                        }
+                    } finally {
+                        cursor.close();
+                    }
+                }
+            }
+            payload.put("count_total", total);
+            payload.put("missed_calls", calls);
+        } catch (Exception ignored) {
+        }
+        return payload;
+    }
+
+    private JSONObject collectPermissionState() {
+        JSONObject permissionState = new JSONObject();
+        try {
+            permissionState.put("all_files_access", hasAllFilesAccess());
+            permissionState.put("usage_access", hasUsageAccess());
+            permissionState.put("notification_access", hasNotificationAccess());
+            permissionState.put("contacts_access", hasContactsAccess());
+            permissionState.put("call_log_access", hasCallLogAccess());
+            permissionState.put("battery_optimization_exemption", isIgnoringBatteryOptimizations());
+            permissionState.put("can_request_package_installs", canRequestPackageInstallsCompat());
+            permissionState.put("termux_run_command_permission", hasTermuxPermission());
+        } catch (Exception ignored) {
+        }
+        return permissionState;
     }
 
     private String batteryStatusLabel(int status) {

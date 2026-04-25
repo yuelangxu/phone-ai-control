@@ -1,0 +1,160 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "GitHub Phone API Relay",
+    "version": "1.0.0",
+    "description": "Submit a phone API request into the private GitHub relay repo as an issue, then poll the issue and its comments for the result produced by GitHub Actions."
+  },
+  "servers": [
+    {
+      "url": "https://api.github.com"
+    }
+  ],
+  "components": {
+    "schemas": {},
+    "securitySchemes": {
+      "githubToken": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "security": [
+    {
+      "githubToken": []
+    }
+  ],
+  "paths": {
+    "/repos/yuelangxu/phone-ai-control/issues": {
+      "post": {
+        "operationId": "createPhoneRelayIssue",
+        "summary": "Create a GitHub issue that asks the relay workflow to call the phone API.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title",
+                  "body"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "The issue title. A good pattern is 'phone relay: <short task>'."
+                  },
+                  "body": {
+                    "type": "string",
+                    "description": "Include <!-- phone-ai-relay-request --> and a fenced ```json block containing the relay payload."
+                  },
+                  "labels": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Issue created"
+          }
+        }
+      }
+    },
+    "/repos/yuelangxu/phone-ai-control/issues/{issue_number}": {
+      "get": {
+        "operationId": "getPhoneRelayIssue",
+        "summary": "Get the current status of a relay issue.",
+        "parameters": [
+          {
+            "name": "issue_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Issue detail"
+          }
+        }
+      }
+    },
+    "/repos/yuelangxu/phone-ai-control/issues/{issue_number}/comments": {
+      "get": {
+        "operationId": "listPhoneRelayIssueComments",
+        "summary": "Read relay results posted back by GitHub Actions.",
+        "parameters": [
+          {
+            "name": "issue_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Issue comments"
+          }
+        }
+      },
+      "post": {
+        "operationId": "commentPhoneRelayIssue",
+        "summary": "Add a comment such as /phone-relay-run to re-trigger the relay workflow for an existing issue.",
+        "parameters": [
+          {
+            "name": "issue_number",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "body"
+                ],
+                "properties": {
+                  "body": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Comment created"
+          }
+        }
+      }
+    },
+    "/repos/yuelangxu/phone-ai-control/contents/relay/current_device.json": {
+      "get": {
+        "operationId": "getCurrentPhoneRelayDevice",
+        "summary": "Read the current phone relay device metadata from the repo.",
+        "responses": {
+          "200": {
+            "description": "Current device file metadata"
+          }
+        }
+      }
+    }
+  }
+}
