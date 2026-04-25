@@ -3,6 +3,7 @@ package com.example.phoneaicontrol;
 import android.Manifest;
 import android.app.Activity;
 import android.app.ActivityManager;
+import android.app.AlertDialog;
 import android.app.AlarmManager;
 import android.app.AppOpsManager;
 import android.app.Notification;
@@ -120,7 +121,9 @@ public class MainActivity extends Activity {
     private TextView modeText;
     private TextView githubAccountText;
     private TextView phoneTokenInfoText;
+    private TextView githubOauthInfoText;
     private EditText pollIntervalInput;
+    private EditText githubOauthClientIdInput;
     private ImageView githubAvatarView;
     private Button startButton;
     private Button stopPublicButton;
@@ -135,6 +138,8 @@ public class MainActivity extends Activity {
     private Button githubLogoutSettingsButton;
     private Button rotatePhoneTokenButton;
     private Button copyPhoneTokenSettingsButton;
+    private Button saveGithubOauthClientIdButton;
+    private Button openGithubOauthGuideButton;
     private Button modeTraditionalButton;
     private Button modeGithubButton;
     private Button navStatusButton;
@@ -170,6 +175,8 @@ public class MainActivity extends Activity {
     private long lastMissedCallsPushMs = 0L;
     private boolean missedCallsPushInFlight = false;
     private long lastPublicReconnectKickMs = 0L;
+    private static final String OAUTH_PREFS = "phone_ai_oauth";
+    private static final String PREF_OAUTH_WIZARD_ACK = "oauth_wizard_ack";
     private final Runnable periodicRefreshRunnable = new Runnable() {
         @Override
         public void run() {
@@ -529,6 +536,28 @@ public class MainActivity extends Activity {
         accountPanel.addView(githubLoginSettingsButton);
         settingsPanel.addView(accountPanel);
 
+        LinearLayout oauthPanel = panel();
+        oauthPanel.addView(sectionTitle("GitHub OAuth Device Flow"));
+        githubOauthInfoText = card(
+                "OAuth Client ID",
+                "Leave this blank to use the built-in public Client ID. Paste your own Client ID here only if you want this app to use your own GitHub OAuth App."
+        );
+        oauthPanel.addView(githubOauthInfoText);
+        githubOauthClientIdInput = new EditText(this);
+        githubOauthClientIdInput.setSingleLine(true);
+        githubOauthClientIdInput.setInputType(InputType.TYPE_CLASS_TEXT);
+        githubOauthClientIdInput.setHint("Optional custom GitHub OAuth Client ID");
+        githubOauthClientIdInput.setTextColor(Color.WHITE);
+        githubOauthClientIdInput.setHintTextColor(Color.parseColor("#68717E"));
+        githubOauthClientIdInput.setBackground(makeRoundedDrawable("#12161C", "#2A303A", 1));
+        githubOauthClientIdInput.setPadding(dp(12), dp(10), dp(12), dp(10));
+        oauthPanel.addView(githubOauthClientIdInput);
+        saveGithubOauthClientIdButton = actionButton("Save / Clear Custom Client ID", false);
+        openGithubOauthGuideButton = actionButton("Open GitHub OAuth Setup Guide", false);
+        oauthPanel.addView(saveGithubOauthClientIdButton);
+        oauthPanel.addView(openGithubOauthGuideButton);
+        settingsPanel.addView(oauthPanel);
+
         LinearLayout tokenPanel = panel();
         tokenPanel.addView(sectionTitle("Phone API Token"));
         phoneTokenInfoText = card(
@@ -630,6 +659,22 @@ public class MainActivity extends Activity {
                 @Override
                 public void onClick(View v) {
                     startGitHubLoginFlow();
+                }
+            });
+        }
+        if (saveGithubOauthClientIdButton != null) {
+            saveGithubOauthClientIdButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    saveGitHubOauthClientIdFromInput();
+                }
+            });
+        }
+        if (openGithubOauthGuideButton != null) {
+            openGithubOauthGuideButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    openGitHubOAuthAppGuide();
                 }
             });
         }
@@ -2153,6 +2198,7 @@ public class MainActivity extends Activity {
         int mode = AutomationSettings.getRelayMode(this);
         boolean hasRelayConfig = GitHubRelaySync.hasLocalRelayConfig(this);
         boolean hasDeviceFlow = GitHubDeviceFlow.isConfigured(this);
+        boolean hasCustomClientId = GitHubDeviceFlow.hasUserConfiguredClientId(this);
         if (modeText != null) {
             if (mode == AutomationSettings.RELAY_MODE_GITHUB) {
                 modeText.setText("模式 (Mode)\nGitHub Relay (中继模式)\nPhone AI Control will sync device state to your configured private GitHub relay repo.");
@@ -2197,6 +2243,32 @@ public class MainActivity extends Activity {
                             : (hasRelayConfig ? "Relink GitHub Account" : "Login / Link GitHub Account")
             );
             githubLoginSettingsButton.setAlpha(1f);
+        }
+        if (githubOauthInfoText != null) {
+            String effectiveClientId = GitHubDeviceFlow.loadClientId(this);
+            if (hasCustomClientId) {
+                githubOauthInfoText.setText(
+                        "OAuth Client ID\n"
+                                + "Custom override is active.\n"
+                                + "Current custom Client ID: " + effectiveClientId + "\n"
+                                + "Clear the field and save if you want to go back to the built-in public Client ID."
+                );
+            } else {
+                githubOauthInfoText.setText(
+                        "OAuth Client ID\n"
+                                + "No custom override is set.\n"
+                                + "This app will use the built-in public GitHub OAuth Client ID by default.\n"
+                                + "Paste your own Client ID only if you want to override it."
+                );
+            }
+        }
+        if (githubOauthClientIdInput != null) {
+            String customClientId = GitHubDeviceFlow.loadUserConfiguredClientId(this);
+            String current = githubOauthClientIdInput.getText() == null ? "" : githubOauthClientIdInput.getText().toString();
+            if (!customClientId.equals(current)) {
+                githubOauthClientIdInput.setText(customClientId);
+                githubOauthClientIdInput.setSelection(githubOauthClientIdInput.getText().length());
+            }
         }
         if (githubLogoutSettingsButton != null) {
             githubLogoutSettingsButton.setEnabled(hasRelayConfig);
@@ -2467,6 +2539,14 @@ public class MainActivity extends Activity {
     }
 
     private void startGitHubLoginFlow() {
+        if (!GitHubDeviceFlow.hasUserConfiguredClientId(this) && !isOAuthWizardAcknowledged()) {
+            showGitHubOAuthSetupWizard();
+            return;
+        }
+        beginGitHubLoginFlow();
+    }
+
+    private void beginGitHubLoginFlow() {
         if (!GitHubDeviceFlow.isConfigured(this)) {
             openGitHubTokenSetup();
             return;
@@ -2528,6 +2608,71 @@ public class MainActivity extends Activity {
         }, "PhoneAiGitHubDeviceFlow").start();
     }
 
+    private void showGitHubOAuthSetupWizard() {
+        final EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setInputType(InputType.TYPE_CLASS_TEXT);
+        input.setHint("Optional custom GitHub OAuth Client ID");
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.parseColor("#68717E"));
+        input.setBackground(makeRoundedDrawable("#12161C", "#2A303A", 1));
+        input.setPadding(dp(12), dp(10), dp(12), dp(10));
+
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp(4), dp(4), dp(4), 0);
+
+        TextView guide = text(
+                "This app can use a built-in public GitHub OAuth Client ID for normal users.\n\n"
+                        + "If you want your own GitHub OAuth App instead:\n"
+                        + "1. Open GitHub OAuth App setup in the browser.\n"
+                        + "2. Create an OAuth App and enable Device Flow.\n"
+                        + "3. Copy the Client ID.\n"
+                        + "4. Come back here and paste it below.\n\n"
+                        + "Leave the field blank if you want to continue with the built-in public Client ID.",
+                14,
+                Color.WHITE,
+                false
+        );
+        guide.setPadding(0, 0, 0, dp(12));
+        container.addView(guide);
+        container.addView(input);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("GitHub OAuth Setup")
+                .setView(container)
+                .setNegativeButton("Not now", null)
+                .setNeutralButton("Open GitHub OAuth App Page", null)
+                .setPositiveButton("Continue to GitHub Login", null)
+                .create();
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String typed = input.getText() == null ? "" : input.getText().toString().trim();
+                if (!typed.isEmpty()) {
+                    GitHubRelaySync.saveOAuthClientOverride(MainActivity.this, typed, GitHubDeviceFlow.loadScope(MainActivity.this));
+                    refreshRelayModeUi();
+                }
+                acknowledgeOAuthWizard();
+                openGitHubOAuthAppGuide();
+            }
+        });
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String typed = input.getText() == null ? "" : input.getText().toString().trim();
+                if (!typed.isEmpty()) {
+                    GitHubRelaySync.saveOAuthClientOverride(MainActivity.this, typed, GitHubDeviceFlow.loadScope(MainActivity.this));
+                    refreshRelayModeUi();
+                }
+                acknowledgeOAuthWizard();
+                dialog.dismiss();
+                beginGitHubLoginFlow();
+            }
+        });
+    }
+
     private void openGitHubTokenSetup() {
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(GitHubRelaySync.buildTokenSetupUrl()));
@@ -2545,6 +2690,55 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             Toast.makeText(this, "Could not open GitHub token setup: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
+    }
+
+    private void openGitHubOAuthAppGuide() {
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/settings/applications/new"));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+            detailText.setText(
+                    "运行诊断 (Diagnostics)\n"
+                            + "GitHub OAuth App setup opened.\n"
+                            + "Create an OAuth App, enable Device Flow, copy the Client ID, then come back here and paste it into the custom Client ID field in Settings.\n"
+                            + "If you do not want your own OAuth App, you can leave the field blank and use the built-in public Client ID."
+            );
+            Toast.makeText(this, "GitHub OAuth App setup opened in browser.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open GitHub OAuth App setup: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void saveGitHubOauthClientIdFromInput() {
+        if (githubOauthClientIdInput == null) {
+            return;
+        }
+        String clientId = githubOauthClientIdInput.getText() == null
+                ? ""
+                : githubOauthClientIdInput.getText().toString().trim();
+        boolean ok = GitHubRelaySync.saveOAuthClientOverride(this, clientId, GitHubDeviceFlow.loadScope(this));
+        if (!ok) {
+            Toast.makeText(this, "Could not save the GitHub OAuth Client ID.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        acknowledgeOAuthWizard();
+        if (clientId.isEmpty()) {
+            Toast.makeText(this, "Cleared the custom Client ID. The app will use its built-in public GitHub OAuth Client ID.", Toast.LENGTH_LONG).show();
+        } else {
+            Toast.makeText(this, "Saved the custom GitHub OAuth Client ID.", Toast.LENGTH_LONG).show();
+        }
+        refreshRelayModeUi();
+    }
+
+    private boolean isOAuthWizardAcknowledged() {
+        return getSharedPreferences(OAUTH_PREFS, MODE_PRIVATE).getBoolean(PREF_OAUTH_WIZARD_ACK, false);
+    }
+
+    private void acknowledgeOAuthWizard() {
+        getSharedPreferences(OAUTH_PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_OAUTH_WIZARD_ACK, true)
+                .apply();
     }
 
     private void openBrowserForGitHubDeviceFlow(String verificationUri, String userCode) {

@@ -135,6 +135,39 @@ final class GitHubRelaySync {
                 && !config.optString("repo", "").trim().isEmpty();
     }
 
+    static synchronized boolean saveOAuthClientOverride(Context context, String clientId, String scope) {
+        try {
+            JSONObject config = loadConfig(context);
+            if (config == null) {
+                config = new JSONObject();
+                config.put("enabled", true);
+                config.put("api_base", DEFAULT_API_BASE);
+                config.put("branch", DEFAULT_BRANCH);
+                config.put("contents_path", DEFAULT_CONTENTS_PATH);
+                config.put("device_id", "phone-main");
+                config.put("device_name", DEFAULT_DEVICE_NAME);
+                config.put("github_token_file", "github-relay-token.txt");
+            }
+            String normalizedClientId = clientId == null ? "" : clientId.trim();
+            String normalizedScope = scope == null ? "" : scope.trim();
+            if (normalizedClientId.isEmpty()) {
+                config.remove("oauth_client_id");
+            } else {
+                config.put("oauth_client_id", normalizedClientId);
+            }
+            if (!normalizedScope.isEmpty()) {
+                config.put("oauth_scope", normalizedScope);
+            } else if (!config.has("oauth_scope")) {
+                config.put("oauth_scope", "repo read:user");
+            }
+            writeJsonFile(resolveConfigFile(context), config);
+            return true;
+        } catch (Exception e) {
+            logError("Failed to save GitHub OAuth client override.", e);
+            return false;
+        }
+    }
+
     static synchronized JSONObject loadGitHubAccountProfile(Context context, boolean allowRefresh) {
         JSONObject config = loadConfig(context);
         if (config == null) {
