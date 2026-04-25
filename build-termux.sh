@@ -1,5 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
 APP_NAME="PhoneAIControl"
 ANDROID_JAR="${ANDROID_JAR:-$HOME/android-sdk/platforms/android-35/android.jar}"

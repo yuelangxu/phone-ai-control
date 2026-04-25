@@ -1,0 +1,903 @@
+package com.example.phoneaicontrol;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.Uri;
+import android.os.BatteryManager;
+import android.os.Build;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.provider.AlarmClock;
+import android.provider.MediaStore;
+import android.provider.Settings;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+public class AutomationLoopService extends Service {
+    private static final String ACTION_START = "com.example.phoneaicontrol.action.START_AUTOMATION_LOOP";
+    private static final String ACTION_STOP = "com.example.phoneaicontrol.action.STOP_AUTOMATION_LOOP";
+    private static final String RUN_COMMAND_ACTION = "com.termux.RUN_COMMAND";
+    private static final String RUN_COMMAND_PATH_EXTRA = "com.termux.RUN_COMMAND_PATH";
+    private static final String RUN_COMMAND_ARGUMENTS_EXTRA = "com.termux.RUN_COMMAND_ARGUMENTS";
+    private static final String RUN_COMMAND_WORKDIR_EXTRA = "com.termux.RUN_COMMAND_WORKDIR";
+    private static final String RUN_COMMAND_BACKGROUND_EXTRA = "com.termux.RUN_COMMAND_BACKGROUND";
+    private static final String RUN_COMMAND_PENDING_INTENT_EXTRA = "com.termux.RUN_COMMAND_PENDING_INTENT";
+    private static final String DEFAULT_LOCAL_API = "http://127.0.0.1:8787";
+    private static final String TERMUX_HOME = "/data/data/com.termux/files/home";
+    private static final String TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash";
+    private static final String PHONE_AI_RUNTIME_FILE = "/storage/emulated/0/Android/media/com.example.phoneaicontrol/runtime.json";
+    private static final String NOTIFICATION_CHANNEL_ID = "phone_ai_control_alerts";
+    private static final String SERVICE_CHANNEL_ID = "phone_ai_control_service";
+    private static final int SERVICE_NOTIFICATION_ID = 4101;
+    private static final long AUTO_INSTALL_MIN_INTERVAL_MS = 2000L;
+    private static final long AUTO_DEVICE_ACTION_MIN_INTERVAL_MS = 1500L;
+    private static final long BATTERY_PUSH_MIN_INTERVAL_MS = 15000L;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable pollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            long intervalMs = AutomationSettings.getPollIntervalMs(AutomationLoopService.this);
+            if (intervalMs <= 0L) {
+                stopForeground(true);
+                stopSelf();
+                return;
+            }
+            pollOnce();
+            handler.postDelayed(this, intervalMs);
+        }
+    };
+
+    private final BroadcastReceiver commandReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!TokenResultService.BROADCAST_COMMAND_RESULT.equals(intent.getAction())) {
+                return;
+            }
+            String actionName = intent.getStringExtra(TokenResultService.EXTRA_ACTION_NAME);
+            if (!TokenResultService.ACTION_DISCOVER_LOCAL_API.equals(actionName)) {
+                return;
+            }
+            discoveryInFlight = false;
+            String stdout = intent.getStringExtra(TokenResultService.EXTRA_STDOUT);
+            if (stdout == null) {
+                return;
+            }
+            String discovered = stdout.replaceAll("[^0-9]", "");
+            if (discovered.length() == 4) {
+                currentLocalApiBase = "http://127.0.0.1:" + discovered;
+                updateServiceNotification();
+            }
+        }
+    };
+
+    private String currentLocalApiBase = DEFAULT_LOCAL_API;
+    private boolean discoveryInFlight = false;
+    private long lastAutoInstallKickMs = 0L;
+    private boolean autoInstallRequestInFlight = false;
+    private long lastAutoDeviceActionKickMs = 0L;
+    private boolean autoDeviceActionRequestInFlight = false;
+    private long lastBatteryPushMs = 0L;
+    private boolean batteryPushInFlight = false;
+
+    public static void start(Context context) {
+        if (!AutomationSettings.isPollingEnabled(context)) {
+            stop(context);
+            return;
+        }
+        Intent intent = new Intent(context, AutomationLoopService.class);
+        intent.setAction(ACTION_START);
+        if (Build.VERSION.SDK_INT >= 26) {
+            context.startForegroundService(intent);
+        } else {
+            context.startService(intent);
+        }
+    }
+
+    public static void stop(Context context) {
+        try {
+            Intent intent = new Intent(context, AutomationLoopService.class);
+            intent.setAction(ACTION_STOP);
+            context.startService(intent);
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        ensureNotificationChannels();
+        registerReceiver(commandReceiver, new IntentFilter(TokenResultService.BROADCAST_COMMAND_RESULT));
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            handler.removeCallbacks(pollRunnable);
+            stopForeground(true);
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
+        if (!AutomationSettings.isPollingEnabled(this)) {
+            handler.removeCallbacks(pollRunnable);
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        startForeground(SERVICE_NOTIFICATION_ID, buildServiceNotification());
+        handler.removeCallbacks(pollRunnable);
+        handler.post(pollRunnable);
+        return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        handler.removeCallbacks(pollRunnable);
+        try {
+            unregisterReceiver(commandReceiver);
+        } catch (Exception ignored) {
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    private void pollOnce() {
+        pushBatteryStatusIfNeeded();
+        maybeAutoHandleInstallRequests();
+        maybeAutoHandleDeviceActions();
+    }
+
+    private void ensureNotificationChannels() {
+        if (Build.VERSION.SDK_INT < 26) {
+            return;
+        }
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        if (manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
+            NotificationChannel alertChannel = new NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    "Phone AI Control",
+                    NotificationManager.IMPORTANCE_DEFAULT
+            );
+            alertChannel.setDescription("Notifications created by the Phone AI Control API bridge.");
+            manager.createNotificationChannel(alertChannel);
+        }
+        if (manager.getNotificationChannel(SERVICE_CHANNEL_ID) == null) {
+            NotificationChannel serviceChannel = new NotificationChannel(
+                    SERVICE_CHANNEL_ID,
+                    "Phone AI Control Background",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            serviceChannel.setDescription("Keeps Phone AI Control polling the local API for device actions.");
+            serviceChannel.setShowBadge(false);
+            manager.createNotificationChannel(serviceChannel);
+        }
+    }
+
+    private Notification buildServiceNotification() {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent openPendingIntent = PendingIntent.getActivity(
+                this,
+                8101,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0)
+        );
+
+        int intervalSeconds = AutomationSettings.getPollIntervalSeconds(this);
+        String content = "Watching local API";
+        if (currentLocalApiBase != null && !currentLocalApiBase.trim().isEmpty()) {
+            content = "Watching " + currentLocalApiBase;
+        }
+        if (intervalSeconds > 0) {
+            content += " every " + intervalSeconds + "s";
+        }
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, SERVICE_CHANNEL_ID)
+                : new Notification.Builder(this);
+        builder.setContentTitle("Phone AI Control active")
+                .setContentText(content)
+                .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(openPendingIntent)
+                .setWhen(System.currentTimeMillis())
+                .setShowWhen(false);
+        if (Build.VERSION.SDK_INT < 26) {
+            builder.setPriority(Notification.PRIORITY_MIN);
+        }
+        return builder.build();
+    }
+
+    private void updateServiceNotification() {
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        manager.notify(SERVICE_NOTIFICATION_ID, buildServiceNotification());
+    }
+
+    private synchronized String resolveLocalApiBase(int timeoutMs) throws Exception {
+        java.util.LinkedHashSet<String> candidates = new java.util.LinkedHashSet<String>();
+        if (currentLocalApiBase != null && !currentLocalApiBase.trim().isEmpty()) {
+            candidates.add(currentLocalApiBase.trim());
+        }
+        JSONObject runtime = readRuntimeState();
+        if (runtime != null) {
+            String runtimeUrl = runtime.optString("local_api_url", "").trim();
+            int runtimePort = runtime.optInt("local_port", 0);
+            if (!runtimeUrl.isEmpty()) {
+                candidates.add(runtimeUrl);
+            }
+            if (runtimePort >= 1000 && runtimePort <= 9999) {
+                candidates.add("http://127.0.0.1:" + runtimePort);
+            }
+        }
+        candidates.add(DEFAULT_LOCAL_API);
+        Exception lastError = null;
+        for (String candidate : candidates) {
+            try {
+                JSONObject health = getJson(candidate + "/healthz", timeoutMs);
+                if (health.optBoolean("ok", false)) {
+                    currentLocalApiBase = candidate;
+                    updateServiceNotification();
+                    return candidate;
+                }
+            } catch (Exception e) {
+                lastError = e;
+            }
+        }
+        triggerPortDiscovery();
+        if (lastError != null) {
+            throw lastError;
+        }
+        throw new IllegalStateException("Local API unavailable");
+    }
+
+    private JSONObject readRuntimeState() {
+        try {
+            File runtimeFile = new File(PHONE_AI_RUNTIME_FILE);
+            if (!runtimeFile.exists() || !runtimeFile.isFile()) {
+                return null;
+            }
+            byte[] raw = readFileUpTo(runtimeFile, 16 * 1024);
+            return new JSONObject(new String(raw, StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void triggerPortDiscovery() {
+        if (discoveryInFlight) {
+            return;
+        }
+        discoveryInFlight = true;
+        runManagedTermuxCommand(
+                "cat " + TERMUX_HOME + "/ai-phone-api/port.txt 2>/dev/null || true",
+                TokenResultService.ACTION_DISCOVER_LOCAL_API
+        );
+    }
+
+    private void runManagedTermuxCommand(String command, String actionName) {
+        try {
+            Intent resultIntent = new Intent(this, TokenResultService.class);
+            int executionId = TokenResultService.getNextExecutionId();
+            resultIntent.putExtra(TokenResultService.EXTRA_EXECUTION_ID, executionId);
+            resultIntent.putExtra(TokenResultService.EXTRA_ACTION_NAME, actionName);
+            PendingIntent pendingIntent = PendingIntent.getService(
+                    this,
+                    executionId,
+                    resultIntent,
+                    PendingIntent.FLAG_ONE_SHOT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? PendingIntent.FLAG_MUTABLE : 0)
+            );
+
+            Intent intent = new Intent();
+            intent.setClassName("com.termux", "com.termux.app.RunCommandService");
+            intent.setAction(RUN_COMMAND_ACTION);
+            intent.putExtra(RUN_COMMAND_PATH_EXTRA, TERMUX_BASH);
+            intent.putExtra(RUN_COMMAND_ARGUMENTS_EXTRA, new String[]{"-lc", command});
+            intent.putExtra(RUN_COMMAND_WORKDIR_EXTRA, TERMUX_HOME);
+            intent.putExtra(RUN_COMMAND_BACKGROUND_EXTRA, true);
+            intent.putExtra(RUN_COMMAND_PENDING_INTENT_EXTRA, pendingIntent);
+            startService(intent);
+        } catch (Exception ignored) {
+            discoveryInFlight = false;
+        }
+    }
+
+    private JSONObject getJson(String rawUrl, int timeoutMs) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(rawUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setRequestProperty("User-Agent", "PhoneAIControl/1.0");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("bypass-tunnel-reminder", "1");
+        int code = conn.getResponseCode();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(
+                code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream(),
+                StandardCharsets.UTF_8
+        ));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            sb.append(line);
+        }
+        reader.close();
+        if (code < 200 || code >= 400) {
+            throw new IllegalStateException("HTTP " + code + ": " + sb.toString());
+        }
+        return new JSONObject(sb.toString());
+    }
+
+    private JSONObject requestJson(String method, String rawUrl, String body, int timeoutMs) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(rawUrl).openConnection();
+        conn.setRequestMethod(method);
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setRequestProperty("User-Agent", "PhoneAIControl/1.0");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("bypass-tunnel-reminder", "1");
+        if (body != null) {
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            byte[] raw = body.getBytes(StandardCharsets.UTF_8);
+            conn.setRequestProperty("Content-Length", String.valueOf(raw.length));
+            OutputStream stream = conn.getOutputStream();
+            try {
+                stream.write(raw);
+                stream.flush();
+            } finally {
+                stream.close();
+            }
+        }
+        int code = conn.getResponseCode();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(
+                code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream(),
+                StandardCharsets.UTF_8
+        ));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            sb.append(line);
+        }
+        reader.close();
+        if (code < 200 || code >= 400) {
+            throw new IllegalStateException("HTTP " + code + ": " + sb.toString());
+        }
+        return new JSONObject(sb.toString());
+    }
+
+    private byte[] downloadBinary(String rawUrl, int timeoutMs) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(rawUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setRequestProperty("User-Agent", "PhoneAIControl/1.0");
+        conn.setRequestProperty("Accept", "*/*");
+        int code = conn.getResponseCode();
+        InputStream stream = code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream();
+        byte[] raw = readStreamFully(stream);
+        if (code < 200 || code >= 400) {
+            throw new IllegalStateException("HTTP " + code + ": " + new String(raw, StandardCharsets.UTF_8));
+        }
+        return raw;
+    }
+
+    private byte[] readStreamFully(InputStream stream) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try {
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = stream.read(chunk)) >= 0) {
+                buffer.write(chunk, 0, read);
+            }
+            return buffer.toByteArray();
+        } finally {
+            try {
+                stream.close();
+            } catch (Exception ignored) {
+            }
+            buffer.close();
+        }
+    }
+
+    private byte[] readFileUpTo(File target, int maxBytes) throws Exception {
+        InputStream stream = new java.io.FileInputStream(target);
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream(Math.min(maxBytes, 64 * 1024));
+        try {
+            byte[] chunk = new byte[8192];
+            int remaining = maxBytes;
+            while (remaining > 0) {
+                int read = stream.read(chunk, 0, Math.min(chunk.length, remaining));
+                if (read < 0) {
+                    break;
+                }
+                buffer.write(chunk, 0, read);
+                remaining -= read;
+            }
+            return buffer.toByteArray();
+        } finally {
+            stream.close();
+            buffer.close();
+        }
+    }
+
+    private Uri writeApkToDownloads(String apkName, byte[] raw) throws Exception {
+        String displayName = apkName == null || apkName.trim().isEmpty() ? "PhoneAIInstall.apk" : apkName.trim();
+        if (!displayName.toLowerCase().endsWith(".apk")) {
+            displayName += ".apk";
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Downloads.DISPLAY_NAME, displayName);
+            values.put(MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive");
+            values.put(MediaStore.Downloads.IS_PENDING, 1);
+            Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+            Uri uri = getContentResolver().insert(collection, values);
+            if (uri == null) {
+                throw new IllegalStateException("Could not create Downloads entry");
+            }
+            OutputStream stream = getContentResolver().openOutputStream(uri, "w");
+            if (stream == null) {
+                throw new IllegalStateException("Could not open Downloads output stream");
+            }
+            try {
+                stream.write(raw);
+                stream.flush();
+            } finally {
+                stream.close();
+            }
+            ContentValues finalizeValues = new ContentValues();
+            finalizeValues.put(MediaStore.Downloads.IS_PENDING, 0);
+            getContentResolver().update(uri, finalizeValues, null, null);
+            return uri;
+        }
+        File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (downloads != null && !downloads.exists() && !downloads.mkdirs() && !downloads.exists()) {
+            throw new IllegalStateException("Could not create Downloads directory");
+        }
+        File out = new File(downloads, displayName);
+        OutputStream stream = new java.io.FileOutputStream(out, false);
+        try {
+            stream.write(raw);
+            stream.flush();
+        } finally {
+            stream.close();
+        }
+        return Uri.fromFile(out);
+    }
+
+    private String sha256Hex(byte[] raw) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        return hexEncode(digest.digest(raw));
+    }
+
+    private String hexEncode(byte[] hash) {
+        StringBuilder sb = new StringBuilder(hash.length * 2);
+        for (byte b : hash) {
+            int value = b & 0xff;
+            if (value < 16) {
+                sb.append('0');
+            }
+            sb.append(Integer.toHexString(value));
+        }
+        return sb.toString();
+    }
+
+    private void pushBatteryStatusIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (batteryPushInFlight || now - lastBatteryPushMs < BATTERY_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        batteryPushInFlight = true;
+        lastBatteryPushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectBatteryStatus();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/battery", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    batteryPushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private JSONObject collectBatteryStatus() throws Exception {
+        Intent batteryIntent = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (batteryIntent == null) {
+            throw new IllegalStateException("Battery broadcast unavailable");
+        }
+        int level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        int status = batteryIntent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
+        int plugged = batteryIntent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        int temperature = batteryIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+        int voltage = batteryIntent.getIntExtra(BatteryManager.EXTRA_VOLTAGE, Integer.MIN_VALUE);
+
+        JSONObject payload = new JSONObject();
+        payload.put("level", level);
+        payload.put("scale", scale);
+        payload.put("percent", level >= 0 && scale > 0 ? (level * 100.0d) / scale : JSONObject.NULL);
+        payload.put("status", batteryStatusLabel(status));
+        payload.put("plugged", batteryPluggedLabel(plugged));
+        payload.put("present", batteryIntent.getBooleanExtra(BatteryManager.EXTRA_PRESENT, true));
+        payload.put("technology", emptyToNull(batteryIntent.getStringExtra(BatteryManager.EXTRA_TECHNOLOGY)));
+        payload.put("temperature_c", temperature == Integer.MIN_VALUE ? JSONObject.NULL : (temperature / 10.0d));
+        payload.put("voltage_mv", voltage == Integer.MIN_VALUE ? JSONObject.NULL : voltage);
+        payload.put("source", "phone_ai_control_service");
+        payload.put("captured_epoch_ms", System.currentTimeMillis());
+        return payload;
+    }
+
+    private String batteryStatusLabel(int status) {
+        switch (status) {
+            case BatteryManager.BATTERY_STATUS_CHARGING:
+                return "charging";
+            case BatteryManager.BATTERY_STATUS_DISCHARGING:
+                return "discharging";
+            case BatteryManager.BATTERY_STATUS_FULL:
+                return "full";
+            case BatteryManager.BATTERY_STATUS_NOT_CHARGING:
+                return "not_charging";
+            default:
+                return "unknown";
+        }
+    }
+
+    private String batteryPluggedLabel(int plugged) {
+        switch (plugged) {
+            case BatteryManager.BATTERY_PLUGGED_AC:
+                return "ac";
+            case BatteryManager.BATTERY_PLUGGED_USB:
+                return "usb";
+            case BatteryManager.BATTERY_PLUGGED_WIRELESS:
+                return "wireless";
+            default:
+                return "unplugged";
+        }
+    }
+
+    private String emptyToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    private void maybeAutoHandleInstallRequests() {
+        long now = System.currentTimeMillis();
+        if (autoInstallRequestInFlight || now - lastAutoInstallKickMs < AUTO_INSTALL_MIN_INTERVAL_MS) {
+            return;
+        }
+        autoInstallRequestInFlight = true;
+        lastAutoInstallKickMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = requestJson("GET", resolveLocalApiBase(1500) + "/v1/local/install-apk/pending", null, 6000);
+                    JSONObject pending = payload.optJSONObject("pending");
+                    if (pending == null) {
+                        autoInstallRequestInFlight = false;
+                        return;
+                    }
+                    executeInstallRequestLocally(pending);
+                } catch (Exception ignored) {
+                    autoInstallRequestInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private void executeInstallRequestLocally(final JSONObject request) {
+        final String requestId = request.optString("id", "");
+        final String localDownloadUrl = request.optString("local_download_url", "");
+        final String apkName = request.optString("apk_name", "PhoneAIInstall.apk");
+        final String packageName = request.optString("package_name", "");
+        if (requestId.isEmpty() || localDownloadUrl.isEmpty()) {
+            autoInstallRequestInFlight = false;
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    byte[] raw = downloadBinary(resolveLocalApiBase(1500) + localDownloadUrl, 60000);
+                    String expectedSha256 = request.optString("artifact_sha256", "").trim().toLowerCase();
+                    String actualSha256 = sha256Hex(raw);
+                    if (!expectedSha256.isEmpty() && !expectedSha256.equals(actualSha256)) {
+                        throw new IllegalStateException("APK SHA256 mismatch");
+                    }
+                    final Uri apkUri = writeApkToDownloads(apkName, raw);
+                    final JSONObject result = new JSONObject();
+                    result.put("apk_name", apkName);
+                    result.put("package_name", packageName);
+                    result.put("bytes", raw.length);
+                    result.put("sha256", actualSha256);
+                    result.put("uri", apkUri.toString());
+                    if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+                        Intent settingsIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()));
+                        settingsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(settingsIntent);
+                        completeInstallRequestAsync(requestId, "needs_unknown_sources_permission", result, "Phone AI Control cannot request package installs yet.");
+                        return;
+                    }
+                    Intent installIntent = new Intent(Intent.ACTION_VIEW);
+                    installIntent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+                    installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(installIntent);
+                    completeInstallRequestAsync(requestId, "installer_launched", result, null);
+                } catch (Exception e) {
+                    completeInstallRequestAsync(requestId, "failed", null, e.getMessage());
+                }
+            }
+        }).start();
+    }
+
+    private void completeInstallRequestAsync(final String requestId, final String status, final JSONObject result, final String lastError) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject body = new JSONObject();
+                    body.put("status", status);
+                    if (result != null) {
+                        body.put("result", result);
+                    }
+                    if (lastError != null && !lastError.trim().isEmpty()) {
+                        body.put("last_error", lastError);
+                    }
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/install-apk/" + requestId + "/complete", body.toString(), 8000);
+                } catch (Exception ignored) {
+                } finally {
+                    autoInstallRequestInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private void maybeAutoHandleDeviceActions() {
+        long now = System.currentTimeMillis();
+        if (autoDeviceActionRequestInFlight || now - lastAutoDeviceActionKickMs < AUTO_DEVICE_ACTION_MIN_INTERVAL_MS) {
+            return;
+        }
+        autoDeviceActionRequestInFlight = true;
+        lastAutoDeviceActionKickMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = requestJson("GET", resolveLocalApiBase(1500) + "/v1/local/device-actions/pending", null, 6000);
+                    JSONObject pending = payload.optJSONObject("pending");
+                    if (pending == null) {
+                        autoDeviceActionRequestInFlight = false;
+                        return;
+                    }
+                    executeDeviceActionLocally(pending);
+                } catch (Exception ignored) {
+                    autoDeviceActionRequestInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private void executeDeviceActionLocally(final JSONObject action) {
+        final String actionId = action.optString("id", "");
+        final String type = action.optString("type", "");
+        final JSONObject payload = action.optJSONObject("payload");
+        if (actionId.isEmpty() || payload == null) {
+            autoDeviceActionRequestInFlight = false;
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject result;
+                    if ("notification".equals(type)) {
+                        result = executeNotificationAction(actionId, payload);
+                    } else if ("alarm".equals(type)) {
+                        result = executeAlarmAction(payload);
+                    } else if ("timer".equals(type)) {
+                        result = executeTimerAction(payload);
+                    } else {
+                        throw new IllegalArgumentException("Unsupported device action type: " + type);
+                    }
+                    completeDeviceActionAsync(actionId, "completed", result, null);
+                } catch (Exception e) {
+                    completeDeviceActionAsync(actionId, "failed", null, e.getMessage());
+                }
+            }
+        }).start();
+    }
+
+    private void completeDeviceActionAsync(final String actionId, final String status, final JSONObject result, final String lastError) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject body = new JSONObject();
+                    body.put("status", status);
+                    if (result != null) {
+                        body.put("result", result);
+                    }
+                    if (lastError != null && !lastError.trim().isEmpty()) {
+                        body.put("last_error", lastError);
+                    }
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device-actions/" + actionId + "/complete", body.toString(), 8000);
+                } catch (Exception ignored) {
+                } finally {
+                    autoDeviceActionRequestInFlight = false;
+                }
+            }
+        }).start();
+    }
+
+    private JSONObject executeNotificationAction(String actionId, JSONObject payload) throws Exception {
+        String title = payload.optString("title", "Phone AI Control");
+        String body = payload.optString("body", "");
+        String tag = emptyToNull(payload.optString("tag", ""));
+        int notificationId = payload.optInt("notification_id", Math.abs(actionId.hashCode()));
+        boolean autoCancel = payload.optBoolean("auto_cancel", true);
+
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent openPendingIntent = PendingIntent.getActivity(
+                this,
+                notificationId,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0)
+        );
+
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+                : new Notification.Builder(this);
+        builder.setContentTitle(title)
+                .setContentText(body)
+                .setStyle(new Notification.BigTextStyle().bigText(body))
+                .setSmallIcon(android.R.drawable.stat_notify_more)
+                .setContentIntent(openPendingIntent)
+                .setAutoCancel(autoCancel)
+                .setWhen(System.currentTimeMillis())
+                .setShowWhen(true);
+        if ("high".equals(payload.optString("importance", ""))) {
+            builder.setDefaults(Notification.DEFAULT_ALL).setPriority(Notification.PRIORITY_HIGH);
+        } else if ("low".equals(payload.optString("importance", ""))) {
+            builder.setPriority(Notification.PRIORITY_LOW);
+        } else {
+            builder.setPriority(Notification.PRIORITY_DEFAULT);
+        }
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) {
+            throw new IllegalStateException("NotificationManager unavailable");
+        }
+        Notification notification = builder.build();
+        if (tag != null) {
+            manager.notify(tag, notificationId, notification);
+        } else {
+            manager.notify(notificationId, notification);
+        }
+        JSONObject result = new JSONObject();
+        result.put("notification_id", notificationId);
+        result.put("tag", tag == null ? JSONObject.NULL : tag);
+        result.put("title", title);
+        result.put("body", body);
+        result.put("executed_by", "phone_ai_control_service");
+        return result;
+    }
+
+    private JSONObject executeAlarmAction(final JSONObject payload) throws Exception {
+        final Exception[] error = new Exception[1];
+        final JSONObject result = new JSONObject();
+        final CountDownLatch latch = new CountDownLatch(1);
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Intent intent = new Intent(AlarmClock.ACTION_SET_ALARM);
+                    intent.putExtra(AlarmClock.EXTRA_HOUR, payload.getInt("hour"));
+                    intent.putExtra(AlarmClock.EXTRA_MINUTES, payload.getInt("minutes"));
+                    intent.putExtra(AlarmClock.EXTRA_MESSAGE, payload.optString("message", ""));
+                    intent.putExtra(AlarmClock.EXTRA_SKIP_UI, payload.optBoolean("skip_ui", true));
+                    intent.putExtra(AlarmClock.EXTRA_VIBRATE, payload.optBoolean("vibrate", true));
+                    String ringtone = emptyToNull(payload.optString("ringtone", ""));
+                    if (ringtone != null) {
+                        intent.putExtra(AlarmClock.EXTRA_RINGTONE, ringtone);
+                    }
+                    JSONArray days = payload.optJSONArray("days");
+                    if (days != null && days.length() > 0) {
+                        ArrayList<Integer> values = new ArrayList<Integer>();
+                        for (int i = 0; i < days.length(); i++) {
+                            values.add(days.getInt(i));
+                        }
+                        intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, values);
+                    }
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(intent);
+                    result.put("hour", payload.getInt("hour"));
+                    result.put("minutes", payload.getInt("minutes"));
+                    result.put("message", payload.optString("message", ""));
+                    result.put("days", days == null ? new JSONArray() : days);
+                    result.put("executed_by", "phone_ai_control_service");
+                } catch (Exception e) {
+                    error[0] = e;
+                } finally {
+                    latch.countDown();
+                }
+            }
+        });
+        latch.await(10, TimeUnit.SECONDS);
+        if (error[0] != null) {
+            throw error[0];
+        }
+        return result;
+    }
+
+    private JSONObject executeTimerAction(final JSONObject payload) throws Exception {
+        final Exception[] error = new Exception[1];
+        final JSONObject result = new JSONObject();
+        final CountDownLatch latch = new CountDownLatch(1);
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Intent intent = new Intent(AlarmClock.ACTION_SET_TIMER);
+                    intent.putExtra(AlarmClock.EXTRA_LENGTH, payload.getInt("length_seconds"));
+                    intent.putExtra(AlarmClock.EXTRA_MESSAGE, payload.optString("message", ""));
+                    intent.putExtra(AlarmClock.EXTRA_SKIP_UI, payload.optBoolean("skip_ui", true));
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(intent);
+                    result.put("length_seconds", payload.getInt("length_seconds"));
+                    result.put("message", payload.optString("message", ""));
+                    result.put("executed_by", "phone_ai_control_service");
+                } catch (Exception e) {
+                    error[0] = e;
+                } finally {
+                    latch.countDown();
+                }
+            }
+        });
+        latch.await(10, TimeUnit.SECONDS);
+        if (error[0] != null) {
+            throw error[0];
+        }
+        return result;
+    }
+}
