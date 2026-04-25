@@ -9,6 +9,37 @@ This relay makes GitHub the control-plane entrypoint for your phone API:
 
 This is intentionally an asynchronous relay. It is not a low-latency reverse proxy.
 
+## Fast bridge architecture
+
+If you want the best overall architecture for a Custom GPT, do not send every request through GitHub Issues.
+
+Instead, use:
+
+- `Phone AI Control` to keep publishing `relay/current_device.json`
+- GitHub as the registry / control plane
+- a stable bridge endpoint that reads GitHub and forwards directly to the current phone tunnel
+
+That bridge is implemented in:
+
+- `bridge/phone_fast_bridge.py`
+- `bridge/requirements-fast-bridge.txt`
+
+The expected runtime model is:
+
+1. the phone only updates GitHub when its public tunnel or health changes
+2. the bridge reads the latest `relay/current_device.json`
+3. the bridge forwards requests to the current `public_url`
+4. your GPT always talks to the stable bridge URL
+
+This keeps normal requests fast while still surviving tunnel changes.
+
+The bridge can expose its own:
+
+- `/healthz`
+- `/openapi.json`
+
+so your GPT action can be bound to the stable bridge instead of the changing tunnel URL.
+
 ## Phone-side GitHub sync
 
 `Phone AI Control` can now publish the current device address and health directly to GitHub, so the relay repo stays aligned even when the tunnel changes.
@@ -20,6 +51,7 @@ Place a config file on the phone at:
 You can start from:
 
 - `relay/github-relay-config.example.json`
+- `relay/github-oauth.example.json`
 
 The safest pattern is:
 
@@ -28,6 +60,15 @@ The safest pattern is:
 - point `github_token_file` at that token file
 
 When configured, the app/service will update `relay/current_device.json` automatically.
+
+Optional config fields:
+
+- `oauth_client_id`
+  - enables GitHub Device Flow in the app
+- `oauth_scope`
+  - default is `repo read:user`
+- `bridge_base_url`
+  - if you deploy the fast bridge, this becomes the preferred URL that the app copies for GPT setup
 
 ## What GitHub stores
 
@@ -96,6 +137,23 @@ Optional payload fields:
 - `close_issue`: whether the workflow should close the issue after posting the result
 
 ## Custom GPT setup
+
+### Option A: stable fast bridge
+
+Best for day-to-day GPT use.
+
+1. Deploy `bridge/phone_fast_bridge.py` somewhere stable.
+2. Point it at your private relay repo with environment variables.
+3. Set a separate `BRIDGE_BEARER_TOKEN`.
+4. Use the bridge's own `/openapi.json` as the GPT action schema URL.
+
+In this mode:
+
+- GPT talks to the bridge
+- the bridge talks to the current phone tunnel
+- GitHub only stores registry state
+
+### Option B: GitHub issue relay
 
 Use `relay/openapi-github-relay.json` as the GPT action schema.
 

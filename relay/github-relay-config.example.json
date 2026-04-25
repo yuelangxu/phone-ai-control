@@ -7,5 +7,8 @@
   "contents_path": "relay/current_device.json",
   "device_id": "phone-main",
   "device_name": "My Phone",
-  "github_token_file": "/storage/emulated/0/Android/media/com.example.phoneaicontrol/github-relay-token.txt"
+  "github_token_file": "/storage/emulated/0/Android/media/com.example.phoneaicontrol/github-relay-token.txt",
+  "oauth_client_id": "Iv1.your_public_github_oauth_client_id",
+  "oauth_scope": "repo read:user",
+  "bridge_base_url": "https://your-stable-bridge.example.com"
 }

@@ -10,6 +10,7 @@ It is no longer just a tunnel toggle. The current app can:
 - copy the API bearer token on demand and clear it from clipboard after 20 seconds
 - show battery information through the local API bridge
 - show usage-access state plus cached usage and memory-pressure information from the Android side
+- sign into GitHub through the official Device Flow when a public OAuth client ID is configured
 - expose a cleaner diagnostics bridge to the phone API so a trusted GPT can request one-shot snapshots or bounded polling instead of relying on constant UI polling
 - execute device actions requested by the API:
   - notifications
@@ -107,6 +108,20 @@ Recommended Knowledge uploads:
 Recommended Instructions seed:
 
 - `knowledge/05-custom-gpt-instructions-template.md`
+
+### GitHub-backed Access Modes
+
+There are now two GitHub-backed patterns in this repository:
+
+- the older async GitHub issue relay under `relay/`
+- the newer fast bridge under `bridge/phone_fast_bridge.py`
+
+The recommended long-term layout is:
+
+- phone publishes `relay/current_device.json`
+- GitHub stores registry state
+- a stable bridge URL forwards to the current phone tunnel
+- Custom GPT talks to the stable bridge instead of the changing tunnel URL
 
 ### Token Handling
 

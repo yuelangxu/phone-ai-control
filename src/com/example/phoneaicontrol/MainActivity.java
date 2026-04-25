@@ -18,6 +18,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -41,6 +43,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -115,7 +118,10 @@ public class MainActivity extends Activity {
     private TextView approvalText;
     private TextView pollingText;
     private TextView modeText;
+    private TextView githubAccountText;
+    private TextView phoneTokenInfoText;
     private EditText pollIntervalInput;
+    private ImageView githubAvatarView;
     private Button startButton;
     private Button stopPublicButton;
     private Button stopAllButton;
@@ -125,6 +131,10 @@ public class MainActivity extends Activity {
     private Button connectGithubButton;
     private Button importGithubTokenButton;
     private Button resetGithubBindingButton;
+    private Button githubLoginSettingsButton;
+    private Button githubLogoutSettingsButton;
+    private Button rotatePhoneTokenButton;
+    private Button copyPhoneTokenSettingsButton;
     private Button modeTraditionalButton;
     private Button modeGithubButton;
     private Button navStatusButton;
@@ -135,10 +145,12 @@ public class MainActivity extends Activity {
     private LinearLayout settingsSection;
     private int currentSection = 0;
     private String currentPublicUrl = "";
+    private String currentPreferredAccessUrl = "";
     private String currentLocalApiBase = DEFAULT_LOCAL_API;
     private String currentPendingApprovalId = "";
     private String pendingLocalApprovalJson = "";
     private String pendingGitHubRelayToken = "";
+    private String currentGitHubAvatarUrl = "";
     private boolean discoveryInFlight = false;
     private long lastDiscoveryKickMs = 0L;
     private long lastAutoApprovalKickMs = 0L;
@@ -488,6 +500,48 @@ public class MainActivity extends Activity {
 
         LinearLayout settingsPanel = panel();
         settingsPanel.addView(sectionTitle("设置 (Settings)"));
+        LinearLayout accountPanel = panel();
+        accountPanel.addView(sectionTitle("GitHub 账户 (GitHub Account)"));
+        LinearLayout accountRow = new LinearLayout(this);
+        accountRow.setOrientation(LinearLayout.HORIZONTAL);
+        accountRow.setGravity(Gravity.CENTER_VERTICAL);
+        accountRow.setPadding(0, 0, 0, dp(8));
+        githubAvatarView = new ImageView(this);
+        LinearLayout.LayoutParams avatarParams = new LinearLayout.LayoutParams(dp(44), dp(44));
+        avatarParams.setMargins(0, 0, dp(10), 0);
+        githubAvatarView.setLayoutParams(avatarParams);
+        githubAvatarView.setImageResource(android.R.drawable.sym_def_app_icon);
+        accountRow.addView(githubAvatarView);
+        githubAccountText = text("Not connected yet.\nUse the login button below to link a GitHub relay account.", 14, Color.WHITE, false);
+        LinearLayout.LayoutParams accountTextParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        githubAccountText.setLayoutParams(accountTextParams);
+        accountRow.addView(githubAccountText);
+        githubLogoutSettingsButton = dangerButton("Log out");
+        LinearLayout.LayoutParams logoutParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        logoutParams.setMargins(dp(10), 0, 0, 0);
+        githubLogoutSettingsButton.setLayoutParams(logoutParams);
+        accountRow.addView(githubLogoutSettingsButton);
+        accountPanel.addView(accountRow);
+        githubLoginSettingsButton = actionButton("Login / Relink GitHub Account", true);
+        accountPanel.addView(githubLoginSettingsButton);
+        settingsPanel.addView(accountPanel);
+
+        LinearLayout tokenPanel = panel();
+        tokenPanel.addView(sectionTitle("Phone API Token"));
+        phoneTokenInfoText = card(
+                "Bearer Token",
+                "This token is created once on first setup and stays the same across tunnel changes. It only changes if you rotate it manually."
+        );
+        tokenPanel.addView(phoneTokenInfoText);
+        copyPhoneTokenSettingsButton = actionButton("Copy Phone API Token (20s)", false);
+        rotatePhoneTokenButton = actionButton("Rotate Phone API Token", false);
+        tokenPanel.addView(copyPhoneTokenSettingsButton);
+        tokenPanel.addView(rotatePhoneTokenButton);
+        settingsPanel.addView(tokenPanel);
+
         Button allFilesButton = actionButton("Open All Files Access Settings", false);
         Button usageAccessButton = actionButton("Open Usage Access Settings", false);
         Button notificationAccessButton = actionButton("Open Notification Access Settings", false);
@@ -505,7 +559,7 @@ public class MainActivity extends Activity {
         detailText = card("运行诊断 (Diagnostics)", "Waiting for the first check.");
         settingsPanel.addView(detailText);
         TextView note = text(
-                "Security note: tokens stay in local app-controlled storage. Copied token text is cleared from clipboard after 20 seconds.",
+                "Security note: tokens stay in local app-controlled storage. Copied token text is cleared from clipboard after 20 seconds. Each device gets its own randomly generated Phone API token on first setup.",
                 12,
                 Color.parseColor("#8D96A2"),
                 false);
@@ -549,12 +603,36 @@ public class MainActivity extends Activity {
                 copyToken();
             }
         });
+        if (copyPhoneTokenSettingsButton != null) {
+            copyPhoneTokenSettingsButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    copyToken();
+                }
+            });
+        }
+        if (rotatePhoneTokenButton != null) {
+            rotatePhoneTokenButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    rotatePhoneApiToken();
+                }
+            });
+        }
         connectGithubButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                openGitHubTokenSetup();
+                startGitHubLoginFlow();
             }
         });
+        if (githubLoginSettingsButton != null) {
+            githubLoginSettingsButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    startGitHubLoginFlow();
+                }
+            });
+        }
         importGithubTokenButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -579,6 +657,14 @@ public class MainActivity extends Activity {
                 resetGitHubRelayBinding();
             }
         });
+        if (githubLogoutSettingsButton != null) {
+            githubLogoutSettingsButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    resetGitHubRelayBinding();
+                }
+            });
+        }
         settingsButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -730,6 +816,13 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    private Button dangerButton(String label) {
+        Button button = actionButton(label, false);
+        button.setTextColor(Color.WHITE);
+        button.setBackground(makeRoundedDrawable("#D44949", "#D44949", 0));
+        return button;
+    }
+
     private Button modeButton(String label) {
         Button button = new Button(this);
         button.setText(label);
@@ -785,6 +878,7 @@ public class MainActivity extends Activity {
             String details = "";
             String repoSummary = "";
             String publicUrl = "";
+            JSONObject githubAccountProfile = null;
             boolean shouldReconnectPublicTunnel = false;
             String reconnectReason = "";
             final boolean allFiles = hasAllFilesAccess();
@@ -890,19 +984,34 @@ public class MainActivity extends Activity {
             } else {
                 repoSummary = "traditional direct mode\nGitHub relay is idle in this mode.";
             }
+            githubAccountProfile = GitHubRelaySync.loadGitHubAccountProfile(MainActivity.this, true);
             String finalLocalStatus = localStatus;
             String finalPublicStatus = publicStatus;
             String finalDetails = details;
             String finalRepoSummary = repoSummary;
             String finalPublicUrl = publicUrl;
+            final String finalPreferredAccessUrl = GitHubRelaySync.getPreferredAccessUrl(MainActivity.this, publicUrl);
+            final JSONObject finalGithubAccountProfile = githubAccountProfile;
             final boolean finalShouldReconnectPublicTunnel = shouldReconnectPublicTunnel;
             final String finalReconnectReason = reconnectReason;
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
                     currentPublicUrl = finalPublicUrl == null ? "" : finalPublicUrl;
+                    currentPreferredAccessUrl = finalPreferredAccessUrl == null ? "" : finalPreferredAccessUrl;
                     statusText.setText("状态 (Status)\nLocal API: " + finalLocalStatus);
-                    addressText.setText("当前地址 (URL)\n" + (currentPublicUrl.isEmpty() ? "None" : currentPublicUrl));
+                    if (AutomationSettings.isGitHubRelayMode(MainActivity.this)
+                            && !currentPreferredAccessUrl.isEmpty()
+                            && !currentPreferredAccessUrl.equals(currentPublicUrl)) {
+                        addressText.setText(
+                                "当前地址 (URL)\n"
+                                        + currentPreferredAccessUrl
+                                        + "\nvia bridge; current phone tunnel: "
+                                        + (currentPublicUrl.isEmpty() ? "unknown" : currentPublicUrl)
+                        );
+                    } else {
+                        addressText.setText("当前地址 (URL)\n" + (currentPreferredAccessUrl.isEmpty() ? "None" : currentPreferredAccessUrl));
+                    }
                     publicText.setText("公网暴露 (Public Exposure)\n" + finalPublicStatus);
                     if (relayRepoText != null) {
                         relayRepoText.setText("GitHub Relay\n" + finalRepoSummary);
@@ -910,6 +1019,7 @@ public class MainActivity extends Activity {
                     detailText.setText("运行诊断 (Diagnostics)\n" + finalDetails);
                     refreshPollingUi();
                     refreshRelayModeUi();
+                    refreshGitHubAccountUi(finalGithubAccountProfile);
                     if (!"Online".equals(finalLocalStatus)) {
                         currentPendingApprovalId = "";
                         approvalText.setText("Pending Approval\nLocal API is offline.");
@@ -1439,6 +1549,46 @@ public class MainActivity extends Activity {
                             Toast.makeText(MainActivity.this, statusMessage, Toast.LENGTH_LONG).show();
                             setButtons(true);
                             refreshStatus();
+                        }
+                    });
+                }
+            }).start();
+            return;
+        }
+        if (TokenResultService.ACTION_ROTATE_PHONE_API_TOKEN.equals(actionName)) {
+            if (!ok) {
+                String failure = message == null || message.trim().isEmpty() ? "Phone API token rotation failed." : message.trim();
+                detailText.setText("运行诊断 (Diagnostics)\n" + failure);
+                Toast.makeText(this, failure, Toast.LENGTH_LONG).show();
+                setButtons(true);
+                return;
+            }
+            final String newPhoneToken = trimmedStdout;
+            detailText.setText("运行诊断 (Diagnostics)\nPhone API token rotated. Syncing the updated token to GitHub relay if configured...");
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    final JSONObject relayState;
+                    if (GitHubRelaySync.hasLocalRelayConfig(MainActivity.this)) {
+                        relayState = GitHubRelaySync.updatePhoneApiBearerToken(MainActivity.this, newPhoneToken);
+                    } else {
+                        relayState = null;
+                    }
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            StringBuilder builder = new StringBuilder();
+                            builder.append("Phone API token rotated successfully.\n");
+                            builder.append("This device will keep using the new token until you rotate it again manually.");
+                            if (relayState != null) {
+                                builder.append("\nGitHub relay: ").append(relayState.optString("last_message", "updated"));
+                            } else {
+                                builder.append("\nGitHub relay: not configured locally, so no relay token update was needed.");
+                            }
+                            detailText.setText("运行诊断 (Diagnostics)\n" + builder);
+                            Toast.makeText(MainActivity.this, "Phone API token rotated.", Toast.LENGTH_LONG).show();
+                            setButtons(true);
+                            scheduleRefreshes(1500, 5000, 12000);
                         }
                     });
                 }
@@ -2001,6 +2151,8 @@ public class MainActivity extends Activity {
 
     private void refreshRelayModeUi() {
         int mode = AutomationSettings.getRelayMode(this);
+        boolean hasRelayConfig = GitHubRelaySync.hasLocalRelayConfig(this);
+        boolean hasDeviceFlow = GitHubDeviceFlow.isConfigured(this);
         if (modeText != null) {
             if (mode == AutomationSettings.RELAY_MODE_GITHUB) {
                 modeText.setText("模式 (Mode)\nGitHub Relay (中继模式)\nPhone AI Control will sync device state to your configured private GitHub relay repo.");
@@ -2019,25 +2171,137 @@ public class MainActivity extends Activity {
             modeGithubButton.setBackground(makeRoundedDrawable(active ? "#4AE02C" : "#222831", active ? "#4AE02C" : "#222831", 0));
         }
         if (githubRepoButton != null) {
-            githubRepoButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
-            githubRepoButton.setAlpha(mode == AutomationSettings.RELAY_MODE_GITHUB ? 1f : 0.55f);
+            githubRepoButton.setAlpha(1f);
         }
         if (copyGithubTokenButton != null) {
-            copyGithubTokenButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
-            copyGithubTokenButton.setAlpha(mode == AutomationSettings.RELAY_MODE_GITHUB ? 1f : 0.55f);
+            copyGithubTokenButton.setAlpha(1f);
         }
         if (connectGithubButton != null) {
-            connectGithubButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
-            connectGithubButton.setAlpha(mode == AutomationSettings.RELAY_MODE_GITHUB ? 1f : 0.55f);
+            connectGithubButton.setText(
+                    hasDeviceFlow
+                            ? (hasRelayConfig ? "重新登录 GitHub 账户" : "登录 GitHub 账户")
+                            : (hasRelayConfig ? "重新连接 GitHub / 更换 Token" : "登录 GitHub / 创建 Token")
+            );
+            connectGithubButton.setAlpha(1f);
         }
         if (importGithubTokenButton != null) {
-            importGithubTokenButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
-            importGithubTokenButton.setAlpha(mode == AutomationSettings.RELAY_MODE_GITHUB ? 1f : 0.55f);
+            importGithubTokenButton.setAlpha(1f);
         }
         if (resetGithubBindingButton != null) {
-            resetGithubBindingButton.setEnabled(mode == AutomationSettings.RELAY_MODE_GITHUB);
-            resetGithubBindingButton.setAlpha(mode == AutomationSettings.RELAY_MODE_GITHUB ? 1f : 0.55f);
+            resetGithubBindingButton.setAlpha(hasRelayConfig ? 1f : 0.55f);
         }
+        if (githubLoginSettingsButton != null) {
+            githubLoginSettingsButton.setText(
+                    hasDeviceFlow
+                            ? (hasRelayConfig ? "Relogin GitHub Account" : "Login GitHub Account")
+                            : (hasRelayConfig ? "Relink GitHub Account" : "Login / Link GitHub Account")
+            );
+            githubLoginSettingsButton.setAlpha(1f);
+        }
+        if (githubLogoutSettingsButton != null) {
+            githubLogoutSettingsButton.setEnabled(hasRelayConfig);
+            githubLogoutSettingsButton.setAlpha(hasRelayConfig ? 1f : 0.55f);
+        }
+        if (phoneTokenInfoText != null) {
+            phoneTokenInfoText.setText(
+                    "Phone API Token\n"
+                            + "Created once on first setup, shared across tunnel changes, and kept stable until you rotate it manually.\n"
+                            + "Different users/devices get different random first tokens."
+            );
+        }
+    }
+
+    private void refreshGitHubAccountUi(JSONObject profile) {
+        boolean configured = GitHubRelaySync.hasLocalRelayConfig(this);
+        if (githubAccountText != null) {
+            String login = normalizedJsonString(profile, "login");
+            String name = normalizedJsonString(profile, "name");
+            if (!login.isEmpty()) {
+                String repoUrl = GitHubRelaySync.getConfiguredRepoUrl(this);
+                StringBuilder body = new StringBuilder();
+                if (!name.isEmpty()) {
+                    body.append(name).append("\n");
+                }
+                body.append("@").append(login);
+                if (!repoUrl.isEmpty()) {
+                    body.append("\n").append(repoUrl);
+                }
+                githubAccountText.setText(body.toString());
+            } else if (configured) {
+                githubAccountText.setText("GitHub relay is linked locally.\nProfile details will appear after the next successful account refresh.");
+            } else {
+                githubAccountText.setText("Not connected yet.\nUse the login button below to link a GitHub relay account.");
+            }
+        }
+        String avatarUrl = normalizedJsonString(profile, "avatar_url");
+        loadGitHubAvatarAsync(avatarUrl);
+        if (githubLogoutSettingsButton != null) {
+            githubLogoutSettingsButton.setEnabled(configured);
+            githubLogoutSettingsButton.setAlpha(configured ? 1f : 0.55f);
+        }
+    }
+
+    private void loadGitHubAvatarAsync(String avatarUrl) {
+        if (githubAvatarView == null) {
+            return;
+        }
+        final String normalizedUrl = avatarUrl == null ? "" : avatarUrl.trim();
+        if (normalizedUrl.isEmpty()) {
+            currentGitHubAvatarUrl = "";
+            githubAvatarView.setImageResource(android.R.drawable.sym_def_app_icon);
+            return;
+        }
+        if (normalizedUrl.equals(currentGitHubAvatarUrl)) {
+            return;
+        }
+        currentGitHubAvatarUrl = normalizedUrl;
+        githubAvatarView.setImageResource(android.R.drawable.sym_def_app_icon);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                HttpURLConnection conn = null;
+                InputStream stream = null;
+                try {
+                    conn = (HttpURLConnection) new URL(normalizedUrl).openConnection();
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(5000);
+                    conn.setRequestProperty("User-Agent", "PhoneAIControl/1.0");
+                    conn.connect();
+                    stream = conn.getInputStream();
+                    final Bitmap bitmap = BitmapFactory.decodeStream(stream);
+                    if (bitmap == null) {
+                        return;
+                    }
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (githubAvatarView != null && normalizedUrl.equals(currentGitHubAvatarUrl)) {
+                                githubAvatarView.setImageBitmap(bitmap);
+                            }
+                        }
+                    });
+                } catch (Exception ignored) {
+                } finally {
+                    try {
+                        if (stream != null) {
+                            stream.close();
+                        }
+                    } catch (Exception ignored) {
+                    }
+                    if (conn != null) {
+                        conn.disconnect();
+                    }
+                }
+            }
+        }).start();
+    }
+
+    private String normalizedJsonString(JSONObject object, String key) {
+        if (object == null || key == null || !object.has(key) || object.isNull(key)) {
+            return "";
+        }
+        String value = object.optString(key, "").trim();
+        return "null".equalsIgnoreCase(value) ? "" : value;
     }
 
     private void showSection(int section) {
@@ -2122,10 +2386,6 @@ public class MainActivity extends Activity {
     }
 
     private void checkOrCreateGitHubRelayRepo() {
-        if (!AutomationSettings.isGitHubRelayMode(this)) {
-            Toast.makeText(this, "Switch to GitHub relay mode first.", Toast.LENGTH_SHORT).show();
-            return;
-        }
         if (!GitHubRelaySync.hasLocalRelayConfig(this)) {
             Toast.makeText(this, "GitHub relay is not configured yet. Connect GitHub first.", Toast.LENGTH_LONG).show();
             openGitHubTokenSetup();
@@ -2180,31 +2440,92 @@ public class MainActivity extends Activity {
     }
 
     private void copyAddress() {
-        String value = currentPublicUrl == null ? "" : currentPublicUrl.trim();
-        if (value.isEmpty() && AutomationSettings.isGitHubRelayMode(this)) {
-            value = GitHubRelaySync.getConfiguredRepoUrl(this);
-        }
+        String value = GitHubRelaySync.getPreferredAccessUrl(this, currentPublicUrl);
         if (value == null || value.isEmpty()) {
             Toast.makeText(this, "No URL is available yet.", Toast.LENGTH_SHORT).show();
             return;
         }
-        String label = AutomationSettings.isGitHubRelayMode(this) && currentPublicUrl != null && currentPublicUrl.trim().isEmpty()
-                ? "GitHub Relay Repo URL"
-                : "Phone AI API URL";
+        String bridge = GitHubRelaySync.getBridgeBaseUrl(this);
+        String label;
+        if (!bridge.isEmpty() && bridge.equals(value)) {
+            label = "Phone AI Bridge URL";
+        } else if (AutomationSettings.isGitHubRelayMode(this) && (currentPublicUrl == null || currentPublicUrl.trim().isEmpty())) {
+            label = "GitHub Relay Repo URL";
+        } else {
+            label = "Phone AI API URL";
+        }
         copyTextToClipboard(label, value, false);
     }
 
     private void copyGitHubToken() {
-        if (!AutomationSettings.isGitHubRelayMode(this)) {
-            Toast.makeText(this, "GitHub token copy is only available in GitHub relay mode.", Toast.LENGTH_SHORT).show();
-            return;
-        }
         String token = GitHubRelaySync.loadGitHubTokenForCopy(this);
         if (token == null || token.trim().isEmpty()) {
             Toast.makeText(this, "No GitHub token is configured yet.", Toast.LENGTH_SHORT).show();
             return;
         }
         copyTextToClipboard("GitHub Relay Token", token.trim(), true);
+    }
+
+    private void startGitHubLoginFlow() {
+        if (!GitHubDeviceFlow.isConfigured(this)) {
+            openGitHubTokenSetup();
+            return;
+        }
+        setButtons(false);
+        detailText.setText("运行诊断 (Diagnostics)\nRequesting a GitHub Device Flow code...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    final JSONObject session = GitHubDeviceFlow.start(MainActivity.this);
+                    final String verificationUri = GitHubDeviceFlow.buildVerificationUri(session);
+                    final String userCode = GitHubDeviceFlow.buildUserCode(session);
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!userCode.isEmpty()) {
+                                copyTextToClipboard("GitHub Device Code", userCode, false);
+                            }
+                            openBrowserForGitHubDeviceFlow(verificationUri, userCode);
+                            detailText.setText(
+                                    "运行诊断 (Diagnostics)\n"
+                                            + "GitHub login started.\n"
+                                            + "1. Finish sign-in in the browser.\n"
+                                            + "2. Enter the device code: " + (userCode.isEmpty() ? "(not provided)" : userCode) + "\n"
+                                            + "3. The app will keep polling GitHub until the authorization is complete."
+                            );
+                            Toast.makeText(MainActivity.this, "GitHub sign-in opened in browser.", Toast.LENGTH_LONG).show();
+                        }
+                    });
+                    final JSONObject tokenPayload = GitHubDeviceFlow.pollForAccessToken(session, 900);
+                    final String accessToken = normalizedJsonString(tokenPayload, "access_token");
+                    if (accessToken.isEmpty()) {
+                        throw new IllegalStateException("GitHub Device Flow completed without an access token.");
+                    }
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            pendingGitHubRelayToken = accessToken;
+                            detailText.setText("运行诊断 (Diagnostics)\nGitHub sign-in succeeded. Reading the Phone API token from Termux to finish relay bootstrap...");
+                            runManagedTermuxCommand(
+                                    "cat " + TERMUX_HOME + "/ai-phone-api/token.txt",
+                                    TokenResultService.ACTION_READ_PHONE_API_TOKEN,
+                                    "GitHub sign-in complete. Loading the Phone API token..."
+                            );
+                        }
+                    });
+                } catch (final Exception e) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            detailText.setText("运行诊断 (Diagnostics)\nGitHub Device Flow failed: " + e.getMessage());
+                            Toast.makeText(MainActivity.this, "GitHub login failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                            setButtons(true);
+                        }
+                    });
+                }
+            }
+        }, "PhoneAiGitHubDeviceFlow").start();
     }
 
     private void openGitHubTokenSetup() {
@@ -2214,9 +2535,11 @@ public class MainActivity extends Activity {
             startActivity(intent);
             detailText.setText(
                     "运行诊断 (Diagnostics)\n"
-                            + "GitHub token setup opened in your browser.\n"
+                            + "GitHub token setup opened in your browser as a fallback flow.\n"
                             + "If you are not signed in, GitHub will ask you to sign in first.\n"
-                            + "After you create the token, copy it and come back here to tap '导入剪贴板中的 GitHub Token'."
+                            + "After you create the token, copy it and come back here to tap '导入剪贴板中的 GitHub Token'.\n"
+                            + "Once imported, the linked GitHub avatar and username will appear in Settings.\n"
+                            + "To enable the smoother standard login flow, configure a GitHub OAuth Device Flow client_id for this app."
             );
             Toast.makeText(this, "Browser opened for GitHub token setup.", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
@@ -2224,11 +2547,17 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void importGitHubTokenFromClipboard() {
-        if (!AutomationSettings.isGitHubRelayMode(this)) {
-            Toast.makeText(this, "Switch to GitHub relay mode first.", Toast.LENGTH_SHORT).show();
-            return;
+    private void openBrowserForGitHubDeviceFlow(String verificationUri, String userCode) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(verificationUri));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open GitHub login page: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
+    }
+
+    private void importGitHubTokenFromClipboard() {
         ClipboardManager manager = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         String token = "";
         if (manager != null && manager.hasPrimaryClip()) {
@@ -2258,6 +2587,7 @@ public class MainActivity extends Activity {
     private void resetGitHubRelayBinding() {
         pendingGitHubRelayToken = "";
         currentPublicUrl = "";
+        currentGitHubAvatarUrl = "";
         JSONObject state = GitHubRelaySync.clearLocalBinding(this);
         if (relayRepoText != null) {
             relayRepoText.setText("GitHub 仓库\n" + GitHubRelaySync.describeForUi(this));
@@ -2265,6 +2595,36 @@ public class MainActivity extends Activity {
         detailText.setText("运行诊断 (Diagnostics)\n" + state.optString("last_message", "GitHub relay local binding was cleared."));
         Toast.makeText(this, "GitHub relay local binding was cleared.", Toast.LENGTH_LONG).show();
         refreshStatus();
+    }
+
+    private void rotatePhoneApiToken() {
+        if (!hasTermuxPermission()) {
+            requestTermuxPermissionIfNeeded();
+            Toast.makeText(this, "Termux command permission is required.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        setButtons(false);
+        detailText.setText("运行诊断 (Diagnostics)\nRotating the Phone API token and restarting the local API...");
+        String command =
+                "python - <<'PY'\n" +
+                "from pathlib import Path\n" +
+                "import secrets\n" +
+                "base = Path.home() / 'ai-phone-api'\n" +
+                "base.mkdir(parents=True, exist_ok=True)\n" +
+                "token_file = base / 'token.txt'\n" +
+                "token = secrets.token_urlsafe(32)\n" +
+                "token_file.write_text(token + '\\n', encoding='utf-8')\n" +
+                "print(token)\n" +
+                "PY\n" +
+                "chmod 600 \"$HOME/ai-phone-api/token.txt\" >/dev/null 2>&1 || true\n" +
+                "if [ -x \"$HOME/ai-phone-api/stop-phone-ai-api.sh\" ]; then \"$HOME/ai-phone-api/stop-phone-ai-api.sh\" >/dev/null 2>&1 || true; fi\n" +
+                "sleep 1\n" +
+                "if [ -x \"$HOME/ai-phone-api/start-phone-ai-api.sh\" ]; then \"$HOME/ai-phone-api/start-phone-ai-api.sh\" >/dev/null 2>&1 || true; fi";
+        runManagedTermuxCommand(
+                command,
+                TokenResultService.ACTION_ROTATE_PHONE_API_TOKEN,
+                "Rotating the Phone API token..."
+        );
     }
 
     private void copyTextToClipboard(String label, String value, boolean autoClear) {
@@ -2343,19 +2703,31 @@ public class MainActivity extends Activity {
             applyPollingButton.setEnabled(enabled);
         }
         if (githubRepoButton != null) {
-            githubRepoButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+            githubRepoButton.setEnabled(enabled);
         }
         if (copyGithubTokenButton != null) {
-            copyGithubTokenButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+            copyGithubTokenButton.setEnabled(enabled);
         }
         if (connectGithubButton != null) {
-            connectGithubButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+            connectGithubButton.setEnabled(enabled);
         }
         if (importGithubTokenButton != null) {
-            importGithubTokenButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+            importGithubTokenButton.setEnabled(enabled);
         }
         if (resetGithubBindingButton != null) {
-            resetGithubBindingButton.setEnabled(enabled && AutomationSettings.isGitHubRelayMode(this));
+            resetGithubBindingButton.setEnabled(enabled && GitHubRelaySync.hasLocalRelayConfig(this));
+        }
+        if (githubLoginSettingsButton != null) {
+            githubLoginSettingsButton.setEnabled(enabled);
+        }
+        if (githubLogoutSettingsButton != null) {
+            githubLogoutSettingsButton.setEnabled(enabled && GitHubRelaySync.hasLocalRelayConfig(this));
+        }
+        if (rotatePhoneTokenButton != null) {
+            rotatePhoneTokenButton.setEnabled(enabled);
+        }
+        if (copyPhoneTokenSettingsButton != null) {
+            copyPhoneTokenSettingsButton.setEnabled(enabled);
         }
         if (modeTraditionalButton != null) {
             modeTraditionalButton.setEnabled(enabled);

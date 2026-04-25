@@ -76,6 +76,35 @@ final class GitHubRelaySync {
         return "https://github.com/" + owner + "/" + repo;
     }
 
+    static synchronized JSONObject loadRelayConfigSnapshot(Context context) {
+        JSONObject config = loadConfig(context);
+        return config == null ? null : cloneObject(config);
+    }
+
+    static File resolveAppMediaFile(Context context, String name) {
+        return new File(resolveMediaDir(context), name);
+    }
+
+    static synchronized String getBridgeBaseUrl(Context context) {
+        JSONObject config = loadConfig(context);
+        if (config == null) {
+            return "";
+        }
+        return normalizePublicUrl(config.optString("bridge_base_url", ""));
+    }
+
+    static synchronized String getPreferredAccessUrl(Context context, String currentPhonePublicUrl) {
+        String bridge = getBridgeBaseUrl(context);
+        if (!bridge.isEmpty()) {
+            return bridge;
+        }
+        String normalizedPhone = normalizePublicUrl(currentPhonePublicUrl);
+        if (!normalizedPhone.isEmpty()) {
+            return normalizedPhone;
+        }
+        return getConfiguredRepoUrl(context);
+    }
+
     static synchronized String loadGitHubTokenForCopy(Context context) {
         JSONObject config = loadConfig(context);
         if (config == null) {
@@ -104,6 +133,33 @@ final class GitHubRelaySync {
         }
         return !config.optString("owner", "").trim().isEmpty()
                 && !config.optString("repo", "").trim().isEmpty();
+    }
+
+    static synchronized JSONObject loadGitHubAccountProfile(Context context, boolean allowRefresh) {
+        JSONObject config = loadConfig(context);
+        if (config == null) {
+            return null;
+        }
+        JSONObject cached = extractAccountProfile(config);
+        if (cached != null && normalizedOptString(cached, "login").length() > 0) {
+            return cached;
+        }
+        if (!allowRefresh) {
+            return cached;
+        }
+        String token = loadGitHubToken(context, config);
+        if (token.isEmpty()) {
+            return cached;
+        }
+        try {
+            JSONObject user = getAuthenticatedUser(emptyToDefault(config.optString("api_base", ""), DEFAULT_API_BASE), token);
+            applyUserProfile(config, user);
+            writeJsonFile(resolveConfigFile(context), config);
+            return extractAccountProfile(config);
+        } catch (Exception e) {
+            logError("Failed to refresh GitHub account profile.", e);
+            return cached;
+        }
     }
 
     static synchronized String buildTokenSetupUrl() {
@@ -150,6 +206,7 @@ final class GitHubRelaySync {
             config.put("device_id", "phone-main");
             config.put("device_name", DEFAULT_DEVICE_NAME);
             config.put("github_token_file", "github-relay-token.txt");
+            applyUserProfile(config, user);
 
             writeTextFile(resolveDefaultTokenFile(context), normalizedGitHubToken + "\n");
             writeJsonFile(resolveConfigFile(context), config);
@@ -172,6 +229,39 @@ final class GitHubRelaySync {
             putSafe(failed, "last_ok", false);
             return writeState(context, failed);
         }
+    }
+
+    static synchronized JSONObject updatePhoneApiBearerToken(Context context, String phoneApiToken) {
+        JSONObject config = loadConfig(context);
+        if (config == null) {
+            return writeState(context, buildUnconfiguredState(context, "GitHub relay is not configured."));
+        }
+        String normalizedPhoneToken = phoneApiToken == null ? "" : phoneApiToken.trim();
+        if (normalizedPhoneToken.isEmpty()) {
+            return writeState(context, buildInvalidConfigState(context, config, "Phone API token is missing."));
+        }
+        String token = loadGitHubToken(context, config);
+        if (token.isEmpty()) {
+            return writeState(context, buildInvalidConfigState(context, config, "GitHub relay token is missing."));
+        }
+        JSONObject state = mergeBaseState(context, loadState(context), config);
+        putSafe(state, "configured", true);
+        putSafe(state, "enabled", config.optBoolean("enabled", true));
+        putSafe(state, "last_attempt_epoch_ms", System.currentTimeMillis());
+        try {
+            JSONObject phoneSecret = new JSONObject();
+            phoneSecret.put("updated_at", iso8601Utc(System.currentTimeMillis()));
+            phoneSecret.put("phone_api_bearer_token", normalizedPhoneToken);
+            putRepoTextFile(config, token, BOOTSTRAP_PHONE_SECRET_PATH, phoneSecret.toString(2) + "\n", "update phone api token store");
+            putSafe(state, "last_ok", true);
+            putSafe(state, "last_message", "Updated GitHub relay phone API token.");
+            putSafe(state, "last_success_epoch_ms", System.currentTimeMillis());
+        } catch (Exception e) {
+            putSafe(state, "last_ok", false);
+            putSafe(state, "last_message", "Phone API token sync failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            logError("Failed to update phone API token in GitHub relay repo.", e);
+        }
+        return writeState(context, state);
     }
 
     static synchronized JSONObject ensureRelayRepository(Context context, boolean allowCreate) {
@@ -310,6 +400,11 @@ final class GitHubRelaySync {
             payload.put("healthy", localApiOk && (!publicEnabled || publicReachable));
             payload.put("public_url", publicUrl.isEmpty() ? JSONObject.NULL : publicUrl);
             payload.put("schema_url", publicUrl.isEmpty() ? JSONObject.NULL : publicUrl + "/openapi.json");
+            String bridgeBaseUrl = normalizePublicUrl(configuredBridgeBaseUrl(context));
+            payload.put("bridge_base_url", bridgeBaseUrl.isEmpty() ? JSONObject.NULL : bridgeBaseUrl);
+            payload.put("preferred_access_url", !bridgeBaseUrl.isEmpty()
+                    ? bridgeBaseUrl
+                    : (publicUrl.isEmpty() ? JSONObject.NULL : publicUrl));
             payload.put("auth_required", authRequired);
             payload.put("localtunnel_running", localtunnelRunning);
             payload.put("cloudflared_running", cloudflaredRunning);
@@ -493,6 +588,10 @@ final class GitHubRelaySync {
         } else {
             sb.append("\ngithub sync: waiting for first attempt");
         }
+        String bridgeBaseUrl = normalizePublicUrl(config.optString("bridge_base_url", ""));
+        if (!bridgeBaseUrl.isEmpty()) {
+            sb.append("\nbridge: ").append(bridgeBaseUrl);
+        }
         return sb.toString();
     }
 
@@ -508,6 +607,14 @@ final class GitHubRelaySync {
             logError("Failed to load GitHub relay config.", e);
             return null;
         }
+    }
+
+    private static String configuredBridgeBaseUrl(Context context) {
+        JSONObject config = loadConfig(context);
+        if (config == null) {
+            return "";
+        }
+        return config.optString("bridge_base_url", "");
     }
 
     private static JSONObject loadState(Context context) {
@@ -542,6 +649,44 @@ final class GitHubRelaySync {
             logError("Failed to write GitHub relay state.", e);
         }
         return state;
+    }
+
+    private static void applyUserProfile(JSONObject config, JSONObject user) {
+        if (config == null || user == null) {
+            return;
+        }
+        putSafe(config, "github_login", emptyToNull(user.optString("login", "")));
+        putSafe(config, "github_name", emptyToNull(user.optString("name", "")));
+        putSafe(config, "github_avatar_url", emptyToNull(user.optString("avatar_url", "")));
+        putSafe(config, "github_html_url", emptyToNull(user.optString("html_url", "")));
+        if (user.has("id")) {
+            putSafe(config, "github_user_id", user.optLong("id", 0L));
+        }
+        putSafe(config, "github_profile_updated_at", iso8601Utc(System.currentTimeMillis()));
+    }
+
+    private static JSONObject extractAccountProfile(JSONObject config) {
+        if (config == null) {
+            return null;
+        }
+        JSONObject profile = new JSONObject();
+        putSafe(profile, "login", emptyToNull(normalizedOptString(config, "github_login")));
+        putSafe(profile, "name", emptyToNull(normalizedOptString(config, "github_name")));
+        putSafe(profile, "avatar_url", emptyToNull(normalizedOptString(config, "github_avatar_url")));
+        putSafe(profile, "html_url", emptyToNull(normalizedOptString(config, "github_html_url")));
+        if (config.has("github_user_id")) {
+            putSafe(profile, "id", config.optLong("github_user_id", 0L));
+        }
+        putSafe(profile, "updated_at", emptyToNull(normalizedOptString(config, "github_profile_updated_at")));
+        return profile;
+    }
+
+    private static String normalizedOptString(JSONObject object, String key) {
+        if (object == null || key == null || !object.has(key) || object.isNull(key)) {
+            return "";
+        }
+        String value = object.optString(key, "").trim();
+        return "null".equalsIgnoreCase(value) ? "" : value;
     }
 
     private static JSONObject buildUnconfiguredState(Context context, String message) {
