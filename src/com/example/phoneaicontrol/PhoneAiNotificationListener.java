@@ -44,6 +44,14 @@ public class PhoneAiNotificationListener extends NotificationListenerService {
         }
     }
 
+    public static StatusBarNotification[] getCurrentActiveNotifications() {
+        PhoneAiNotificationListener listener = instance;
+        if (listener == null) {
+            return null;
+        }
+        return listener.safeActiveNotifications();
+    }
+
     private StatusBarNotification[] safeActiveNotifications() {
         try {
             return getActiveNotifications();

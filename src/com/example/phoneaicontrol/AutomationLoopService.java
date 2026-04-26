@@ -65,8 +65,8 @@ public class AutomationLoopService extends Service {
     private static final String RUN_COMMAND_BACKGROUND_EXTRA = "com.termux.RUN_COMMAND_BACKGROUND";
     private static final String RUN_COMMAND_PENDING_INTENT_EXTRA = "com.termux.RUN_COMMAND_PENDING_INTENT";
     private static final String DEFAULT_LOCAL_API = "http://127.0.0.1:8787";
-    private static final String TERMUX_HOME = "/data/data/com.termux/files/home";
-    private static final String TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash";
+    private static final String TERMUX_HOME = "/data/user/0/com.termux/files/home";
+    private static final String TERMUX_BASH = "/data/user/0/com.termux/files/usr/bin/bash";
     private static final String PHONE_AI_RUNTIME_FILE = "/storage/emulated/0/Android/media/com.example.phoneaicontrol/runtime.json";
     private static final String NOTIFICATION_CHANNEL_ID = "phone_ai_control_alerts";
     private static final String SERVICE_CHANNEL_ID = "phone_ai_control_service";
@@ -78,6 +78,7 @@ public class AutomationLoopService extends Service {
     private static final long NOTIFICATION_PUSH_MIN_INTERVAL_MS = 10000L;
     private static final long CONTACTS_PUSH_MIN_INTERVAL_MS = 60000L;
     private static final long MISSED_CALLS_PUSH_MIN_INTERVAL_MS = 30000L;
+    private static final long ALARMS_PUSH_MIN_INTERVAL_MS = 30000L;
     private static final long PUBLIC_HEALTH_CHECK_MIN_INTERVAL_MS = 15000L;
     private static final long PUBLIC_RECONNECT_MIN_INTERVAL_MS = 45000L;
     private static final int PUBLIC_PROBE_TIMEOUT_MS = 5000;
@@ -112,8 +113,8 @@ public class AutomationLoopService extends Service {
             if (stdout == null) {
                 return;
             }
-            String discovered = stdout.replaceAll("[^0-9]", "");
-            if (discovered.length() == 4) {
+            String discovered = parseDiscoveredPort(stdout);
+            if (!discovered.isEmpty()) {
                 currentLocalApiBase = "http://127.0.0.1:" + discovered;
                 updateServiceNotification();
             }
@@ -136,9 +137,12 @@ public class AutomationLoopService extends Service {
     private boolean contactsPushInFlight = false;
     private long lastMissedCallsPushMs = 0L;
     private boolean missedCallsPushInFlight = false;
+    private long lastAlarmsPushMs = 0L;
+    private boolean alarmsPushInFlight = false;
     private long lastPublicHealthCheckMs = 0L;
     private long lastPublicReconnectKickMs = 0L;
     private boolean publicHealthCheckInFlight = false;
+    private String lastServiceNotificationContent = "";
 
     private static final class PublicTunnelProbeResult {
         final boolean reachable;
@@ -183,6 +187,7 @@ public class AutomationLoopService extends Service {
     public void onCreate() {
         super.onCreate();
         ensureNotificationChannels();
+        NotificationAccessStore.clearSelfServiceNotificationHistory(this);
         registerReceiver(commandReceiver, new IntentFilter(TokenResultService.BROADCAST_COMMAND_RESULT));
     }
 
@@ -201,6 +206,7 @@ public class AutomationLoopService extends Service {
             return START_NOT_STICKY;
         }
         startForeground(SERVICE_NOTIFICATION_ID, buildServiceNotification());
+        lastServiceNotificationContent = buildServiceNotificationContent();
         handler.removeCallbacks(pollRunnable);
         handler.post(pollRunnable);
         return START_STICKY;
@@ -209,6 +215,10 @@ public class AutomationLoopService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(pollRunnable);
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager != null) {
+            manager.cancel(SERVICE_NOTIFICATION_ID);
+        }
         try {
             unregisterReceiver(commandReceiver);
         } catch (Exception ignored) {
@@ -228,6 +238,7 @@ public class AutomationLoopService extends Service {
         pushNotificationsSnapshotIfNeeded();
         pushContactsSnapshotIfNeeded();
         pushMissedCallsSnapshotIfNeeded();
+        pushAlarmsSnapshotIfNeeded();
         maybeAutoHandleInstallRequests();
         maybeAutoHandleDeviceActions();
     }
@@ -261,6 +272,18 @@ public class AutomationLoopService extends Service {
         }
     }
 
+    private String buildServiceNotificationContent() {
+        int intervalSeconds = AutomationSettings.getPollIntervalSeconds(this);
+        String content = "Watching local API";
+        if (currentLocalApiBase != null && !currentLocalApiBase.trim().isEmpty()) {
+            content = "Watching " + currentLocalApiBase;
+        }
+        if (intervalSeconds > 0) {
+            content += " every " + intervalSeconds + "s";
+        }
+        return content;
+    }
+
     private Notification buildServiceNotification() {
         Intent openIntent = new Intent(this, MainActivity.class);
         openIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -271,14 +294,7 @@ public class AutomationLoopService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0)
         );
 
-        int intervalSeconds = AutomationSettings.getPollIntervalSeconds(this);
-        String content = "Watching local API";
-        if (currentLocalApiBase != null && !currentLocalApiBase.trim().isEmpty()) {
-            content = "Watching " + currentLocalApiBase;
-        }
-        if (intervalSeconds > 0) {
-            content += " every " + intervalSeconds + "s";
-        }
+        String content = buildServiceNotificationContent();
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, SERVICE_CHANNEL_ID)
                 : new Notification.Builder(this);
@@ -301,6 +317,11 @@ public class AutomationLoopService extends Service {
         if (manager == null) {
             return;
         }
+        String content = buildServiceNotificationContent();
+        if (content.equals(lastServiceNotificationContent)) {
+            return;
+        }
+        lastServiceNotificationContent = content;
         manager.notify(SERVICE_NOTIFICATION_ID, buildServiceNotification());
     }
 
@@ -339,6 +360,20 @@ public class AutomationLoopService extends Service {
             throw lastError;
         }
         throw new IllegalStateException("Local API unavailable");
+    }
+
+    private static String parseDiscoveredPort(String stdout) {
+        if (stdout == null) {
+            return "";
+        }
+        String[] lines = stdout.split("\\r?\\n");
+        for (String rawLine : lines) {
+            String line = rawLine == null ? "" : rawLine.trim();
+            if (line.matches("^[0-9]{4,5}$")) {
+                return line;
+            }
+        }
+        return "";
     }
 
     private void maybeAutoHealPublicTunnel() {
@@ -403,7 +438,7 @@ public class AutomationLoopService extends Service {
         }
         discoveryInFlight = true;
         runManagedTermuxCommand(
-                "cat " + TERMUX_HOME + "/ai-phone-api/port.txt 2>/dev/null || true",
+                "sh -c 'head -n 1 " + TERMUX_HOME + "/ai-phone-api/port.txt 2>/dev/null | tr -cd \"0-9\\n\"'",
                 TokenResultService.ACTION_DISCOVER_LOCAL_API
         );
     }
@@ -792,6 +827,27 @@ public class AutomationLoopService extends Service {
         }).start();
     }
 
+    private void pushAlarmsSnapshotIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (alarmsPushInFlight || now - lastAlarmsPushMs < ALARMS_PUSH_MIN_INTERVAL_MS) {
+            return;
+        }
+        alarmsPushInFlight = true;
+        lastAlarmsPushMs = now;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = collectAlarmsSnapshot();
+                    requestJson("POST", resolveLocalApiBase(1500) + "/v1/local/device/alarms", payload.toString(), 5000);
+                } catch (Exception ignored) {
+                } finally {
+                    alarmsPushInFlight = false;
+                }
+            }
+        }).start();
+    }
+
     private JSONObject collectBatteryStatus() throws Exception {
         Intent batteryIntent = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         if (batteryIntent == null) {
@@ -945,32 +1001,54 @@ public class AutomationLoopService extends Service {
             int total = 0;
             if (hasContactsAccess()) {
                 Cursor cursor = getContentResolver().query(
-                        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                        ContactsContract.Contacts.CONTENT_URI,
                         new String[]{
-                                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                                ContactsContract.CommonDataKinds.Phone.NUMBER,
-                                ContactsContract.CommonDataKinds.Phone.STARRED
+                                ContactsContract.Contacts._ID,
+                                ContactsContract.Contacts.LOOKUP_KEY,
+                                ContactsContract.Contacts.DISPLAY_NAME,
+                                ContactsContract.Contacts.STARRED,
+                                ContactsContract.Contacts.PHOTO_URI
                         },
                         null,
                         null,
-                        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE ASC"
+                        ContactsContract.Contacts.DISPLAY_NAME + " COLLATE NOCASE ASC"
                 );
                 if (cursor != null) {
                     try {
-                        int displayNameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME);
-                        int numberIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER);
-                        int starredIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.STARRED);
+                        int idIdx = cursor.getColumnIndex(ContactsContract.Contacts._ID);
+                        int lookupKeyIdx = cursor.getColumnIndex(ContactsContract.Contacts.LOOKUP_KEY);
+                        int displayNameIdx = cursor.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME);
+                        int starredIdx = cursor.getColumnIndex(ContactsContract.Contacts.STARRED);
+                        int photoUriIdx = cursor.getColumnIndex(ContactsContract.Contacts.PHOTO_URI);
+                        ArrayList<Long> contactIds = new ArrayList<Long>();
                         while (cursor.moveToNext()) {
                             total++;
                             if (contacts.length() >= 200) {
                                 continue;
                             }
+                            long contactId = idIdx >= 0 ? cursor.getLong(idIdx) : -1L;
                             JSONObject item = new JSONObject();
+                            item.put("contact_id", contactId >= 0 ? contactId : JSONObject.NULL);
+                            item.put("lookup_key", lookupKeyIdx >= 0 ? emptyToNull(cursor.getString(lookupKeyIdx)) : JSONObject.NULL);
                             item.put("display_name", displayNameIdx >= 0 ? emptyToNull(cursor.getString(displayNameIdx)) : JSONObject.NULL);
-                            item.put("number", numberIdx >= 0 ? emptyToNull(cursor.getString(numberIdx)) : JSONObject.NULL);
                             item.put("starred", starredIdx >= 0 && cursor.getInt(starredIdx) != 0);
+                            item.put("photo_uri", photoUriIdx >= 0 ? emptyToNull(cursor.getString(photoUriIdx)) : JSONObject.NULL);
+                            item.put("note", JSONObject.NULL);
+                            item.put("about", JSONObject.NULL);
+                            item.put("nickname", JSONObject.NULL);
+                            item.put("company", JSONObject.NULL);
+                            item.put("school", JSONObject.NULL);
+                            item.put("title", JSONObject.NULL);
+                            item.put("department", JSONObject.NULL);
+                            item.put("job_description", JSONObject.NULL);
+                            item.put("phone_numbers", new JSONArray());
+                            item.put("emails", new JSONArray());
+                            item.put("websites", new JSONArray());
+                            item.put("organizations", new JSONArray());
                             contacts.put(item);
+                            contactIds.add(contactId);
                         }
+                        enrichContactsSnapshot(contactIds, contacts);
                     } finally {
                         cursor.close();
                     }
@@ -1034,6 +1112,431 @@ public class AutomationLoopService extends Service {
             }
             payload.put("count_total", total);
             payload.put("missed_calls", calls);
+        } catch (Exception ignored) {
+        }
+        return payload;
+    }
+
+    private void enrichContactsSnapshot(ArrayList<Long> contactIds, JSONArray contacts) {
+        if (contactIds == null || contactIds.isEmpty() || contacts == null || contacts.length() == 0) {
+            return;
+        }
+        try {
+            attachPhoneNumbers(contactIds, contacts);
+            attachEmails(contactIds, contacts);
+            attachWebsites(contactIds, contacts);
+            attachOrganizations(contactIds, contacts);
+            attachNotes(contactIds, contacts);
+            attachNicknames(contactIds, contacts);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void attachPhoneNumbers(ArrayList<Long> contactIds, JSONArray contacts) {
+        Cursor cursor = getContentResolver().query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                new String[]{
+                        ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
+                        ContactsContract.CommonDataKinds.Phone.NUMBER,
+                        ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER,
+                        ContactsContract.CommonDataKinds.Phone.TYPE,
+                        ContactsContract.CommonDataKinds.Phone.LABEL
+                },
+                buildInSelection(ContactsContract.CommonDataKinds.Phone.CONTACT_ID, contactIds.size()),
+                toStringArgs(contactIds),
+                ContactsContract.CommonDataKinds.Phone.IS_PRIMARY + " DESC"
+        );
+        if (cursor == null) {
+            return;
+        }
+        try {
+            int contactIdIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID);
+            int numberIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER);
+            int normalizedIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER);
+            int typeIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.TYPE);
+            int labelIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.LABEL);
+            while (cursor.moveToNext()) {
+                long contactId = contactIdIdx >= 0 ? cursor.getLong(contactIdIdx) : -1L;
+                JSONObject contact = findContactById(contacts, contactId);
+                if (contact == null) {
+                    continue;
+                }
+                JSONArray numbers = contact.optJSONArray("phone_numbers");
+                if (numbers == null) {
+                    numbers = new JSONArray();
+                    contact.put("phone_numbers", numbers);
+                }
+                JSONObject item = new JSONObject();
+                item.put("number", numberIdx >= 0 ? emptyToNull(cursor.getString(numberIdx)) : JSONObject.NULL);
+                item.put("normalized_number", normalizedIdx >= 0 ? emptyToNull(cursor.getString(normalizedIdx)) : JSONObject.NULL);
+                item.put("type_label", phoneTypeLabel(typeIdx >= 0 ? cursor.getInt(typeIdx) : 0, labelIdx >= 0 ? cursor.getString(labelIdx) : null));
+                numbers.put(item);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private void attachEmails(ArrayList<Long> contactIds, JSONArray contacts) {
+        Cursor cursor = getContentResolver().query(
+                ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+                new String[]{
+                        ContactsContract.CommonDataKinds.Email.CONTACT_ID,
+                        ContactsContract.CommonDataKinds.Email.ADDRESS,
+                        ContactsContract.CommonDataKinds.Email.TYPE,
+                        ContactsContract.CommonDataKinds.Email.LABEL
+                },
+                buildInSelection(ContactsContract.CommonDataKinds.Email.CONTACT_ID, contactIds.size()),
+                toStringArgs(contactIds),
+                ContactsContract.CommonDataKinds.Email.IS_PRIMARY + " DESC"
+        );
+        if (cursor == null) {
+            return;
+        }
+        try {
+            int contactIdIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Email.CONTACT_ID);
+            int addressIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Email.ADDRESS);
+            int typeIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Email.TYPE);
+            int labelIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Email.LABEL);
+            while (cursor.moveToNext()) {
+                long contactId = contactIdIdx >= 0 ? cursor.getLong(contactIdIdx) : -1L;
+                JSONObject contact = findContactById(contacts, contactId);
+                if (contact == null) {
+                    continue;
+                }
+                JSONArray emails = contact.optJSONArray("emails");
+                if (emails == null) {
+                    emails = new JSONArray();
+                    contact.put("emails", emails);
+                }
+                JSONObject item = new JSONObject();
+                item.put("address", addressIdx >= 0 ? emptyToNull(cursor.getString(addressIdx)) : JSONObject.NULL);
+                item.put("type_label", emailTypeLabel(typeIdx >= 0 ? cursor.getInt(typeIdx) : 0, labelIdx >= 0 ? cursor.getString(labelIdx) : null));
+                emails.put(item);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private void attachWebsites(ArrayList<Long> contactIds, JSONArray contacts) {
+        Cursor cursor = getContentResolver().query(
+                ContactsContract.Data.CONTENT_URI,
+                new String[]{
+                        ContactsContract.Data.CONTACT_ID,
+                        ContactsContract.CommonDataKinds.Website.URL,
+                        ContactsContract.CommonDataKinds.Website.TYPE,
+                        ContactsContract.CommonDataKinds.Website.LABEL
+                },
+                ContactsContract.Data.MIMETYPE + "=? AND " + buildInSelection(ContactsContract.Data.CONTACT_ID, contactIds.size()),
+                prependArg(ContactsContract.CommonDataKinds.Website.CONTENT_ITEM_TYPE, toStringArgs(contactIds)),
+                null
+        );
+        if (cursor == null) {
+            return;
+        }
+        try {
+            int contactIdIdx = cursor.getColumnIndex(ContactsContract.Data.CONTACT_ID);
+            int urlIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Website.URL);
+            int typeIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Website.TYPE);
+            int labelIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Website.LABEL);
+            while (cursor.moveToNext()) {
+                long contactId = contactIdIdx >= 0 ? cursor.getLong(contactIdIdx) : -1L;
+                JSONObject contact = findContactById(contacts, contactId);
+                if (contact == null) {
+                    continue;
+                }
+                JSONArray websites = contact.optJSONArray("websites");
+                if (websites == null) {
+                    websites = new JSONArray();
+                    contact.put("websites", websites);
+                }
+                JSONObject item = new JSONObject();
+                item.put("url", urlIdx >= 0 ? emptyToNull(cursor.getString(urlIdx)) : JSONObject.NULL);
+                item.put("type_label", websiteTypeLabel(typeIdx >= 0 ? cursor.getInt(typeIdx) : 0, labelIdx >= 0 ? cursor.getString(labelIdx) : null));
+                websites.put(item);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private void attachOrganizations(ArrayList<Long> contactIds, JSONArray contacts) {
+        Cursor cursor = getContentResolver().query(
+                ContactsContract.Data.CONTENT_URI,
+                new String[]{
+                        ContactsContract.Data.CONTACT_ID,
+                        ContactsContract.CommonDataKinds.Organization.COMPANY,
+                        ContactsContract.CommonDataKinds.Organization.TITLE,
+                        ContactsContract.CommonDataKinds.Organization.DEPARTMENT,
+                        ContactsContract.CommonDataKinds.Organization.JOB_DESCRIPTION,
+                        ContactsContract.CommonDataKinds.Organization.TYPE,
+                        ContactsContract.CommonDataKinds.Organization.LABEL
+                },
+                ContactsContract.Data.MIMETYPE + "=? AND " + buildInSelection(ContactsContract.Data.CONTACT_ID, contactIds.size()),
+                prependArg(ContactsContract.CommonDataKinds.Organization.CONTENT_ITEM_TYPE, toStringArgs(contactIds)),
+                null
+        );
+        if (cursor == null) {
+            return;
+        }
+        try {
+            int contactIdIdx = cursor.getColumnIndex(ContactsContract.Data.CONTACT_ID);
+            int companyIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.COMPANY);
+            int titleIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.TITLE);
+            int departmentIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.DEPARTMENT);
+            int descriptionIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.JOB_DESCRIPTION);
+            int typeIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.TYPE);
+            int labelIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Organization.LABEL);
+            while (cursor.moveToNext()) {
+                long contactId = contactIdIdx >= 0 ? cursor.getLong(contactIdIdx) : -1L;
+                JSONObject contact = findContactById(contacts, contactId);
+                if (contact == null) {
+                    continue;
+                }
+                JSONArray organizations = contact.optJSONArray("organizations");
+                if (organizations == null) {
+                    organizations = new JSONArray();
+                    contact.put("organizations", organizations);
+                }
+                String company = companyIdx >= 0 ? emptyToNull(cursor.getString(companyIdx)) : null;
+                String title = titleIdx >= 0 ? emptyToNull(cursor.getString(titleIdx)) : null;
+                String department = departmentIdx >= 0 ? emptyToNull(cursor.getString(departmentIdx)) : null;
+                String jobDescription = descriptionIdx >= 0 ? emptyToNull(cursor.getString(descriptionIdx)) : null;
+                String label = organizationTypeLabel(typeIdx >= 0 ? cursor.getInt(typeIdx) : 0, labelIdx >= 0 ? cursor.getString(labelIdx) : null);
+                JSONObject item = new JSONObject();
+                item.put("company", company == null ? JSONObject.NULL : company);
+                item.put("title", title == null ? JSONObject.NULL : title);
+                item.put("department", department == null ? JSONObject.NULL : department);
+                item.put("job_description", jobDescription == null ? JSONObject.NULL : jobDescription);
+                item.put("type_label", label);
+                organizations.put(item);
+
+                boolean schoolLike = looksLikeSchool(label, company, title, department);
+                if (schoolLike && contact.isNull("school") && company != null) {
+                    contact.put("school", company);
+                }
+                if (!schoolLike && contact.isNull("company") && company != null) {
+                    contact.put("company", company);
+                }
+                if (contact.isNull("title") && title != null) {
+                    contact.put("title", title);
+                }
+                if (contact.isNull("department") && department != null) {
+                    contact.put("department", department);
+                }
+                if (contact.isNull("job_description") && jobDescription != null) {
+                    contact.put("job_description", jobDescription);
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private void attachNotes(ArrayList<Long> contactIds, JSONArray contacts) {
+        Cursor cursor = getContentResolver().query(
+                ContactsContract.Data.CONTENT_URI,
+                new String[]{
+                        ContactsContract.Data.CONTACT_ID,
+                        ContactsContract.CommonDataKinds.Note.NOTE
+                },
+                ContactsContract.Data.MIMETYPE + "=? AND " + buildInSelection(ContactsContract.Data.CONTACT_ID, contactIds.size()),
+                prependArg(ContactsContract.CommonDataKinds.Note.CONTENT_ITEM_TYPE, toStringArgs(contactIds)),
+                null
+        );
+        if (cursor == null) {
+            return;
+        }
+        try {
+            int contactIdIdx = cursor.getColumnIndex(ContactsContract.Data.CONTACT_ID);
+            int noteIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Note.NOTE);
+            while (cursor.moveToNext()) {
+                long contactId = contactIdIdx >= 0 ? cursor.getLong(contactIdIdx) : -1L;
+                JSONObject contact = findContactById(contacts, contactId);
+                if (contact == null) {
+                    continue;
+                }
+                String note = noteIdx >= 0 ? emptyToNull(cursor.getString(noteIdx)) : null;
+                if (note != null) {
+                    contact.put("note", note);
+                    contact.put("about", note);
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private void attachNicknames(ArrayList<Long> contactIds, JSONArray contacts) {
+        Cursor cursor = getContentResolver().query(
+                ContactsContract.Data.CONTENT_URI,
+                new String[]{
+                        ContactsContract.Data.CONTACT_ID,
+                        ContactsContract.CommonDataKinds.Nickname.NAME
+                },
+                ContactsContract.Data.MIMETYPE + "=? AND " + buildInSelection(ContactsContract.Data.CONTACT_ID, contactIds.size()),
+                prependArg(ContactsContract.CommonDataKinds.Nickname.CONTENT_ITEM_TYPE, toStringArgs(contactIds)),
+                null
+        );
+        if (cursor == null) {
+            return;
+        }
+        try {
+            int contactIdIdx = cursor.getColumnIndex(ContactsContract.Data.CONTACT_ID);
+            int nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Nickname.NAME);
+            while (cursor.moveToNext()) {
+                long contactId = contactIdIdx >= 0 ? cursor.getLong(contactIdIdx) : -1L;
+                JSONObject contact = findContactById(contacts, contactId);
+                if (contact == null) {
+                    continue;
+                }
+                String nickname = nameIdx >= 0 ? emptyToNull(cursor.getString(nameIdx)) : null;
+                if (nickname != null) {
+                    contact.put("nickname", nickname);
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private JSONObject findContactById(JSONArray contacts, long contactId) {
+        if (contacts == null || contactId < 0) {
+            return null;
+        }
+        for (int i = 0; i < contacts.length(); i++) {
+            JSONObject item = contacts.optJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            if (item.optLong("contact_id", -1L) == contactId) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    private String buildInSelection(String column, int size) {
+        StringBuilder builder = new StringBuilder();
+        builder.append(column).append(" IN (");
+        for (int i = 0; i < size; i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append('?');
+        }
+        builder.append(')');
+        return builder.toString();
+    }
+
+    private String[] toStringArgs(ArrayList<Long> values) {
+        String[] args = new String[values.size()];
+        for (int i = 0; i < values.size(); i++) {
+            args[i] = String.valueOf(values.get(i));
+        }
+        return args;
+    }
+
+    private String[] prependArg(String value, String[] rest) {
+        String[] result = new String[rest.length + 1];
+        result[0] = value;
+        System.arraycopy(rest, 0, result, 1, rest.length);
+        return result;
+    }
+
+    private String phoneTypeLabel(int type, String label) {
+        switch (type) {
+            case ContactsContract.CommonDataKinds.Phone.TYPE_HOME:
+                return "home";
+            case ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE:
+                return "mobile";
+            case ContactsContract.CommonDataKinds.Phone.TYPE_WORK:
+                return "work";
+            case ContactsContract.CommonDataKinds.Phone.TYPE_MAIN:
+                return "main";
+            case ContactsContract.CommonDataKinds.Phone.TYPE_OTHER:
+                return "other";
+            case ContactsContract.CommonDataKinds.Phone.TYPE_CUSTOM:
+                return emptyToNull(label) == null ? "custom" : emptyToNull(label);
+            default:
+                return "other";
+        }
+    }
+
+    private String emailTypeLabel(int type, String label) {
+        switch (type) {
+            case ContactsContract.CommonDataKinds.Email.TYPE_HOME:
+                return "home";
+            case ContactsContract.CommonDataKinds.Email.TYPE_WORK:
+                return "work";
+            case ContactsContract.CommonDataKinds.Email.TYPE_MOBILE:
+                return "mobile";
+            case ContactsContract.CommonDataKinds.Email.TYPE_OTHER:
+                return "other";
+            case ContactsContract.CommonDataKinds.Email.TYPE_CUSTOM:
+                return emptyToNull(label) == null ? "custom" : emptyToNull(label);
+            default:
+                return "other";
+        }
+    }
+
+    private String websiteTypeLabel(int type, String label) {
+        switch (type) {
+            case ContactsContract.CommonDataKinds.Website.TYPE_HOMEPAGE:
+                return "homepage";
+            case ContactsContract.CommonDataKinds.Website.TYPE_HOME:
+                return "home";
+            case ContactsContract.CommonDataKinds.Website.TYPE_WORK:
+                return "work";
+            case ContactsContract.CommonDataKinds.Website.TYPE_BLOG:
+                return "blog";
+            case ContactsContract.CommonDataKinds.Website.TYPE_PROFILE:
+                return "profile";
+            case ContactsContract.CommonDataKinds.Website.TYPE_OTHER:
+                return "other";
+            case ContactsContract.CommonDataKinds.Website.TYPE_CUSTOM:
+                return emptyToNull(label) == null ? "custom" : emptyToNull(label);
+            default:
+                return "other";
+        }
+    }
+
+    private String organizationTypeLabel(int type, String label) {
+        switch (type) {
+            case ContactsContract.CommonDataKinds.Organization.TYPE_WORK:
+                return "work";
+            case ContactsContract.CommonDataKinds.Organization.TYPE_OTHER:
+                return "other";
+            case ContactsContract.CommonDataKinds.Organization.TYPE_CUSTOM:
+                return emptyToNull(label) == null ? "custom" : emptyToNull(label);
+            default:
+                return "other";
+        }
+    }
+
+    private boolean looksLikeSchool(String label, String company, String title, String department) {
+        String combined = ((label == null ? "" : label) + " " +
+                (company == null ? "" : company) + " " +
+                (title == null ? "" : title) + " " +
+                (department == null ? "" : department)).toLowerCase(Locale.US);
+        return combined.contains("school")
+                || combined.contains("university")
+                || combined.contains("college")
+                || combined.contains("academy")
+                || combined.contains("institute");
+    }
+
+    private JSONObject collectAlarmsSnapshot() {
+        JSONObject payload = AlarmStateStore.exportSnapshot(this);
+        try {
+            payload.put("permission_state", collectPermissionState());
         } catch (Exception ignored) {
         }
         return payload;
@@ -1382,6 +1885,7 @@ public class AutomationLoopService extends Service {
         final Exception[] error = new Exception[1];
         final JSONObject result = new JSONObject();
         final CountDownLatch latch = new CountDownLatch(1);
+        final ArrayList<Integer> normalizedDays = AlarmStateStore.normalizeAlarmDays(payload.optJSONArray("days"));
         handler.post(new Runnable() {
             @Override
             public void run() {
@@ -1396,21 +1900,19 @@ public class AutomationLoopService extends Service {
                     if (ringtone != null) {
                         intent.putExtra(AlarmClock.EXTRA_RINGTONE, ringtone);
                     }
-                    JSONArray days = payload.optJSONArray("days");
-                    if (days != null && days.length() > 0) {
-                        ArrayList<Integer> values = new ArrayList<Integer>();
-                        for (int i = 0; i < days.length(); i++) {
-                            values.add(days.getInt(i));
-                        }
-                        intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, values);
+                    if (!normalizedDays.isEmpty()) {
+                        intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, normalizedDays);
                     }
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     startActivity(intent);
                     result.put("hour", payload.getInt("hour"));
                     result.put("minutes", payload.getInt("minutes"));
                     result.put("message", payload.optString("message", ""));
-                    result.put("days", days == null ? new JSONArray() : days);
+                    result.put("note", payload.optString("message", ""));
+                    result.put("calendar_days", AlarmStateStore.calendarDaysJson(normalizedDays));
+                    result.put("weekdays", AlarmStateStore.weekdayNamesJson(normalizedDays));
                     result.put("executed_by", "phone_ai_control_service");
+                    AlarmStateStore.recordManagedAlarm(AutomationLoopService.this, payload, result);
                 } catch (Exception e) {
                     error[0] = e;
                 } finally {

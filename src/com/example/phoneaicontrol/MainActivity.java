@@ -73,9 +73,9 @@ public class MainActivity extends Activity {
     private static final String RUN_COMMAND_BACKGROUND_EXTRA = "com.termux.RUN_COMMAND_BACKGROUND";
     private static final String RUN_COMMAND_PENDING_INTENT_EXTRA = "com.termux.RUN_COMMAND_PENDING_INTENT";
     private static final String DEFAULT_LOCAL_API = "http://127.0.0.1:8787";
-    private static final String TERMUX_HOME = "/data/data/com.termux/files/home";
+    private static final String TERMUX_HOME = "/data/user/0/com.termux/files/home";
     private static final String PHONE_AI_RUNTIME_FILE = "/storage/emulated/0/Android/media/com.example.phoneaicontrol/runtime.json";
-    private static final String TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash";
+    private static final String TERMUX_BASH = "/data/user/0/com.termux/files/usr/bin/bash";
     private static final int REQUEST_RUN_COMMAND = 42;
     private static final int REQUEST_CONFIRM_CREDENTIAL = 43;
     private static final int REQUEST_STORAGE_PERMISSION = 44;
@@ -558,7 +558,7 @@ public class MainActivity extends Activity {
                     discoveryInFlight = true;
                     lastDiscoveryKickMs = nowMs;
                     runManagedTermuxCommand(
-                            "cat " + TERMUX_HOME + "/ai-phone-api/port.txt 2>/dev/null || true",
+                            "sh -c 'head -n 1 " + TERMUX_HOME + "/ai-phone-api/port.txt 2>/dev/null | tr -cd \"0-9\\n\"'",
                             TokenResultService.ACTION_DISCOVER_LOCAL_API,
                             null
                     );
@@ -1011,8 +1011,8 @@ public class MainActivity extends Activity {
         if (TokenResultService.ACTION_DISCOVER_LOCAL_API.equals(actionName)) {
             discoveryInFlight = false;
             if (ok && !trimmedStdout.isEmpty()) {
-                String discovered = trimmedStdout.replaceAll("[^0-9]", "");
-                if (discovered.length() == 4) {
+                String discovered = parseDiscoveredPort(trimmedStdout);
+                if (!discovered.isEmpty()) {
                     final String discoveredBase = "http://127.0.0.1:" + discovered;
                     new Thread(new Runnable() {
                         @Override
@@ -1053,6 +1053,20 @@ public class MainActivity extends Activity {
             Toast.makeText(this, details.toString(), Toast.LENGTH_LONG).show();
         }
         setButtons(true);
+    }
+
+    private static String parseDiscoveredPort(String stdout) {
+        if (stdout == null) {
+            return "";
+        }
+        String[] lines = stdout.split("\\r?\\n");
+        for (String rawLine : lines) {
+            String line = rawLine == null ? "" : rawLine.trim();
+            if (line.matches("^[0-9]{4,5}$")) {
+                return line;
+            }
+        }
+        return "";
     }
 
     private boolean hasSharedStoragePermission() {
@@ -2208,6 +2222,7 @@ public class MainActivity extends Activity {
         final Exception[] error = new Exception[1];
         final JSONObject result = new JSONObject();
         final CountDownLatch latch = new CountDownLatch(1);
+        final ArrayList<Integer> normalizedDays = AlarmStateStore.normalizeAlarmDays(payload.optJSONArray("days"));
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -2222,21 +2237,19 @@ public class MainActivity extends Activity {
                     if (ringtone != null) {
                         intent.putExtra(AlarmClock.EXTRA_RINGTONE, ringtone);
                     }
-                    JSONArray days = payload.optJSONArray("days");
-                    if (days != null && days.length() > 0) {
-                        ArrayList<Integer> values = new ArrayList<Integer>();
-                        for (int i = 0; i < days.length(); i++) {
-                            values.add(days.getInt(i));
-                        }
-                        intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, values);
+                    if (!normalizedDays.isEmpty()) {
+                        intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, normalizedDays);
                     }
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     startActivity(intent);
                     result.put("hour", payload.getInt("hour"));
                     result.put("minutes", payload.getInt("minutes"));
                     result.put("message", payload.optString("message", ""));
-                    result.put("days", days == null ? new JSONArray() : days);
+                    result.put("note", payload.optString("message", ""));
+                    result.put("calendar_days", AlarmStateStore.calendarDaysJson(normalizedDays));
+                    result.put("weekdays", AlarmStateStore.weekdayNamesJson(normalizedDays));
                     result.put("executed_by", "phone_ai_control");
+                    AlarmStateStore.recordManagedAlarm(MainActivity.this, payload, result);
                 } catch (Exception e) {
                     error[0] = e;
                 } finally {

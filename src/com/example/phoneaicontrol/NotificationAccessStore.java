@@ -16,6 +16,8 @@ public final class NotificationAccessStore {
     private static final String PREFS_NAME = "phone_ai_notification_state";
     private static final String KEY_SNAPSHOT_JSON = "snapshot_json";
     private static final int MAX_RECENT_NOTIFICATIONS = 40;
+    private static final String SELF_PACKAGE = "com.example.phoneaicontrol";
+    private static final String SELF_SERVICE_CHANNEL = "phone_ai_control_service";
 
     private NotificationAccessStore() {
     }
@@ -36,7 +38,7 @@ public final class NotificationAccessStore {
     }
 
     public static synchronized JSONObject exportSnapshot(Context context) {
-        JSONObject snapshot = loadSnapshot(context);
+        JSONObject snapshot = sanitizeSnapshot(loadSnapshot(context));
         try {
             snapshot.put("notification_access_granted", hasNotificationAccess(context));
             if (!snapshot.has("captured_epoch_ms")) {
@@ -54,13 +56,26 @@ public final class NotificationAccessStore {
             if (!snapshot.has("active_count")) {
                 snapshot.put("active_count", snapshot.optJSONArray("active_notifications") == null ? 0 : snapshot.optJSONArray("active_notifications").length());
             }
+            StatusBarNotification[] currentActive = PhoneAiNotificationListener.getCurrentActiveNotifications();
+            if (currentActive != null) {
+                JSONArray active = new JSONArray();
+                for (StatusBarNotification sbn : currentActive) {
+                    if (sbn == null || isSelfServiceNotification(sbn)) {
+                        continue;
+                    }
+                    active.put(notificationToJson(sbn, false));
+                }
+                snapshot.put("active_notifications", active);
+                snapshot.put("active_count", active.length());
+                snapshot.put("captured_epoch_ms", System.currentTimeMillis());
+            }
         } catch (Exception ignored) {
         }
         return snapshot;
     }
 
     public static synchronized void updateSnapshot(Context context, StatusBarNotification[] activeNotifications, StatusBarNotification eventNotification, boolean removed) {
-        JSONObject snapshot = loadSnapshot(context);
+        JSONObject snapshot = sanitizeSnapshot(loadSnapshot(context));
         try {
             snapshot.put("source", "phone_ai_control_notification_listener");
             snapshot.put("captured_epoch_ms", System.currentTimeMillis());
@@ -69,7 +84,7 @@ public final class NotificationAccessStore {
             JSONArray active = new JSONArray();
             if (activeNotifications != null) {
                 for (StatusBarNotification sbn : activeNotifications) {
-                    if (sbn == null) {
+                    if (sbn == null || isSelfServiceNotification(sbn)) {
                         continue;
                     }
                     active.put(notificationToJson(sbn, false));
@@ -80,18 +95,26 @@ public final class NotificationAccessStore {
 
             JSONArray previousRecent = snapshot.optJSONArray("recent_notifications");
             JSONArray recent = new JSONArray();
-            if (eventNotification != null) {
+            if (eventNotification != null && !isSelfServiceNotification(eventNotification)) {
                 recent.put(notificationToJson(eventNotification, removed));
             }
             if (previousRecent != null) {
                 for (int i = 0; i < previousRecent.length() && recent.length() < MAX_RECENT_NOTIFICATIONS; i++) {
-                    recent.put(previousRecent.optJSONObject(i));
+                    JSONObject item = previousRecent.optJSONObject(i);
+                    if (item == null || isSelfServiceNotification(item)) {
+                        continue;
+                    }
+                    recent.put(item);
                 }
             }
             snapshot.put("recent_notifications", recent);
         } catch (Exception ignored) {
         }
         saveSnapshot(context, snapshot);
+    }
+
+    public static synchronized void clearSelfServiceNotificationHistory(Context context) {
+        saveSnapshot(context, sanitizeSnapshot(loadSnapshot(context)));
     }
 
     private static JSONObject notificationToJson(StatusBarNotification sbn, boolean removed) {
@@ -154,5 +177,69 @@ public final class NotificationAccessStore {
 
     private static void saveSnapshot(Context context, JSONObject snapshot) {
         prefs(context).edit().putString(KEY_SNAPSHOT_JSON, snapshot == null ? "{}" : snapshot.toString()).apply();
+    }
+
+    private static JSONObject sanitizeSnapshot(JSONObject snapshot) {
+        JSONObject safe = snapshot == null ? new JSONObject() : snapshot;
+        try {
+            JSONArray existingActive = safe.optJSONArray("active_notifications");
+            if (existingActive != null) {
+                JSONArray filteredActive = new JSONArray();
+                for (int i = 0; i < existingActive.length(); i++) {
+                    JSONObject item = existingActive.optJSONObject(i);
+                    if (item == null || isSelfServiceNotification(item)) {
+                        continue;
+                    }
+                    filteredActive.put(item);
+                }
+                safe.put("active_notifications", filteredActive);
+                safe.put("active_count", filteredActive.length());
+            }
+
+            JSONArray existingRecent = safe.optJSONArray("recent_notifications");
+            if (existingRecent != null) {
+                JSONArray filteredRecent = new JSONArray();
+                for (int i = 0; i < existingRecent.length() && filteredRecent.length() < MAX_RECENT_NOTIFICATIONS; i++) {
+                    JSONObject item = existingRecent.optJSONObject(i);
+                    if (item == null || isSelfServiceNotification(item)) {
+                        continue;
+                    }
+                    filteredRecent.put(item);
+                }
+                safe.put("recent_notifications", filteredRecent);
+            }
+        } catch (Exception ignored) {
+        }
+        return safe;
+    }
+
+    private static boolean isSelfServiceNotification(StatusBarNotification sbn) {
+        if (sbn == null) {
+            return false;
+        }
+        try {
+            if (!SELF_PACKAGE.equals(sbn.getPackageName())) {
+                return false;
+            }
+            Notification notification = sbn.getNotification();
+            if (notification == null) {
+                return false;
+            }
+            return Build.VERSION.SDK_INT >= 26 && SELF_SERVICE_CHANNEL.equals(notification.getChannelId());
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isSelfServiceNotification(JSONObject item) {
+        if (item == null) {
+            return false;
+        }
+        try {
+            return SELF_PACKAGE.equals(item.optString("package", ""))
+                    && SELF_SERVICE_CHANNEL.equals(item.optString("channel_id", ""));
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 }

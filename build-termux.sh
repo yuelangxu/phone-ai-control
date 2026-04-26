@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/data/user/0/com.termux/files/usr/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,7 +18,7 @@ KEY_ALIAS="${KEY_ALIAS:-androiddebugkey}"
 KEYSTORE_PASS="${KEYSTORE_PASS:-android}"
 KEY_PASS="${KEY_PASS:-android}"
 
-export PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+export PREFIX="${PREFIX:-/data/user/0/com.termux/files/usr}"
 export JAVA_HOME="${JAVA_HOME:-$PREFIX/lib/jvm/java-21-openjdk}"
 export PATH="$JAVA_HOME/bin:$SDK_BIN:$PREFIX/bin:$PATH"
 
