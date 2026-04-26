@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.phoneaicontrol"
-    android:versionCode="26"
-    android:versionName="1.0.26">
+    android:versionCode="27"
+    android:versionName="1.0.27">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
@@ -55,16 +55,6 @@
         <receiver
             android:name=".ClipboardClearReceiver"
             android:exported="false" />
-        <receiver
-            android:name=".RelayCommandReceiver"
-            android:enabled="true"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.example.phoneaicontrol.action.SET_RELAY_MODE" />
-                <action android:name="com.example.phoneaicontrol.action.ENSURE_GITHUB_RELAY" />
-                <action android:name="com.example.phoneaicontrol.action.SYNC_GITHUB_RELAY" />
-            </intent-filter>
-        </receiver>
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"

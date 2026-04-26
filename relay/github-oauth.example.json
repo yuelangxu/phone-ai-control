@@ -1,5 +1,0 @@
-{
-  "client_id": "Iv1.your_public_github_oauth_client_id",
-  "scope": "repo read:user",
-  "notes": "Copy this to /storage/emulated/0/Android/media/com.example.phoneaicontrol/github-oauth.json if you want Phone AI Control to use GitHub Device Flow without embedding the client_id directly in the APK."
-}

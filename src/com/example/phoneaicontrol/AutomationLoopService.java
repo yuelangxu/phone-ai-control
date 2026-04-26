@@ -246,7 +246,7 @@ public class AutomationLoopService extends Service {
                     "Phone AI Control",
                     NotificationManager.IMPORTANCE_DEFAULT
             );
-            alertChannel.setDescription("Notifications created by the Phone AI Control API bridge.");
+            alertChannel.setDescription("Notifications created by the Phone AI Control API.");
             manager.createNotificationChannel(alertChannel);
         }
         if (manager.getNotificationChannel(SERVICE_CHANNEL_ID) == null) {
@@ -378,23 +378,6 @@ public class AutomationLoopService extends Service {
                     publicProbeDetail = e.getClass().getSimpleName() + ": " + e.getMessage();
                     localStatus = "Offline";
                 } finally {
-                    if (GitHubRelaySync.hasLocalRelayConfig(AutomationLoopService.this)) {
-                        try {
-                            JSONObject relayState = GitHubRelaySync.buildDeviceState(
-                                    AutomationLoopService.this,
-                                    "automation_loop_service",
-                                    localApiBase,
-                                    "Online".equals(localStatus),
-                                    localStatus,
-                                    health,
-                                    publicReachable,
-                                    publicProbeDetail,
-                                    collectPermissionState()
-                            );
-                            GitHubRelaySync.maybeSyncCurrentDevice(AutomationLoopService.this, relayState, false);
-                        } catch (Exception ignored) {
-                        }
-                    }
                     publicHealthCheckInFlight = false;
                 }
             }

@@ -11,7 +11,6 @@ This repository provides **Phone AI Control**, an Android app that works with a 
 - Data may still be processed by services the user chooses to connect, such as:
   - OpenAI / ChatGPT
   - tunnel providers such as Cloudflare Tunnel or localtunnel
-  - GitHub or other repositories and file hosts
   - Android system components such as the package installer, alarm, timer, and notification services
 
 ## What Data The Software Can Handle
