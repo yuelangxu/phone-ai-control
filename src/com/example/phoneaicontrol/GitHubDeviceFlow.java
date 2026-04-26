@@ -15,7 +15,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
 final class GitHubDeviceFlow {
-    private static final String DEFAULT_CLIENT_ID = "Ov23liaPb2HW7Wob06dX";
+    private static final String DEFAULT_CLIENT_ID = "";
     private static final String DEFAULT_SCOPE = "repo read:user";
     private static final String DEVICE_CODE_URL = "https://github.com/login/device/code";
     private static final String ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";

@@ -18,3 +18,9 @@ TERMUX_AI_README.md
 relay/current_device.json
 __pycache__/
 *.pyc
+bridge/.env.local
+bridge/*.pid
+bridge/*.out.log
+bridge/*.err.log
+bridge/*.tunnel.log
+bridge/*.runtime.json

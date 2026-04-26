@@ -2,6 +2,7 @@ import json
 import os
 import time
 import base64
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,8 +18,10 @@ RELAY_BRANCH = os.environ.get("RELAY_BRANCH", "main").strip() or "main"
 REGISTRY_PATH = os.environ.get("REGISTRY_PATH", "relay/current_device.json").strip() or "relay/current_device.json"
 SECRET_PATH = os.environ.get("SECRET_PATH", "relay/phone_api_secret.json").strip() or "relay/phone_api_secret.json"
 BRIDGE_BEARER_TOKEN = os.environ.get("BRIDGE_BEARER_TOKEN", "").strip()
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
 CACHE_TTL_SECONDS = max(0, int(os.environ.get("CACHE_TTL_SECONDS", "10")))
 REQUEST_TIMEOUT_SECONDS = max(3, int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "20")))
+AUTH_DEBUG_LOG = Path(os.environ.get("AUTH_DEBUG_LOG", Path(__file__).with_name("bridge.auth-debug.log").as_posix()))
 
 app = Flask(__name__)
 
@@ -31,6 +34,12 @@ class CacheEntry:
 
 _registry_cache: Optional[CacheEntry] = None
 _secret_cache: Optional[CacheEntry] = None
+
+
+def _append_auth_debug(entry: Dict[str, Any]) -> None:
+    AUTH_DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with AUTH_DEBUG_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _headers() -> Dict[str, str]:
@@ -113,6 +122,36 @@ def _bridge_auth_ok() -> bool:
     return auth == f"Bearer {BRIDGE_BEARER_TOKEN}"
 
 
+def _log_bridge_auth_event(kind: str) -> None:
+    auth = request.headers.get("Authorization", "")
+    normalized_auth = auth.strip()
+    _append_auth_debug(
+        {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "kind": kind,
+            "path": request.path,
+            "method": request.method,
+            "remote_addr": request.remote_addr,
+            "user_agent": request.headers.get("User-Agent", ""),
+            "has_authorization": bool(auth),
+            "authorization_prefix": normalized_auth[:32],
+            "authorization_length": len(auth),
+            "authorization_matches_bridge": normalized_auth == f"Bearer {BRIDGE_BEARER_TOKEN}",
+            "authorization_has_double_bearer": normalized_auth.startswith("Bearer Bearer "),
+        }
+    )
+
+
+def _public_base_url() -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").strip()
+    forwarded_host = request.headers.get("X-Forwarded-Host", "").strip()
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+    return request.url_root.rstrip("/")
+
+
 def _forward(path: str, force_refresh: bool = False) -> Response:
     public_url, phone_token, registry = _resolve_target(force=force_refresh)
     target_url = f"{public_url}/{path.lstrip('/')}" if path else public_url
@@ -163,20 +202,18 @@ def healthz() -> Response:
                 "registry_updated_at": registry.get("updated_at"),
                 "healthy": registry.get("healthy"),
                 "bridge_auth_required": bool(BRIDGE_BEARER_TOKEN),
+                "public_base_url_override": PUBLIC_BASE_URL,
             }
         )
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 503
 
 
-@app.get("/openapi.json")
-def openapi_proxy() -> Response:
+def _proxy_openapi_schema(schema_path: str, title_suffix: str) -> Response:
     try:
-        if not _bridge_auth_ok():
-            return jsonify({"error": "Unauthorized"}), 401
         public_url, phone_token, _ = _resolve_target(force=False)
         upstream = requests.get(
-            public_url + "/openapi.json",
+            public_url + "/" + schema_path.lstrip("/"),
             headers={
                 "Authorization": f"Bearer {phone_token}",
                 "User-Agent": "phone-ai-fast-bridge/1.0",
@@ -186,20 +223,32 @@ def openapi_proxy() -> Response:
         )
         upstream.raise_for_status()
         schema = upstream.json()
-        schema["servers"] = [{"url": request.url_root.rstrip("/")}]
+        schema["servers"] = [{"url": _public_base_url()}]
         info = schema.setdefault("info", {})
-        info["title"] = str(info.get("title", "Phone AI API")) + " (via Fast Bridge)"
+        info["title"] = str(info.get("title", "Phone AI API")) + title_suffix
         return jsonify(schema)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 502
+
+
+@app.get("/openapi.json")
+def openapi_proxy() -> Response:
+    return _proxy_openapi_schema("/openapi.json", " (via Fast Bridge)")
+
+
+@app.get("/openapi-gpt.json")
+def openapi_gpt_proxy() -> Response:
+    return _proxy_openapi_schema("/openapi-gpt.json", " (via Fast Bridge GPT)")
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 def proxy(path: str) -> Response:
     if not _bridge_auth_ok():
+        _log_bridge_auth_event("bridge_auth_failed")
         return jsonify({"error": "Unauthorized"}), 401
-    if path in {"healthz", "openapi.json"}:
+    _log_bridge_auth_event("bridge_auth_ok")
+    if path in {"healthz", "openapi.json", "openapi-gpt.json"}:
         return jsonify({"error": "Reserved path"}), 404
     try:
         return _forward(path, force_refresh=False)

@@ -100,14 +100,12 @@ This repository now includes builder-facing assets for a private Custom GPT:
 
 Recommended Knowledge uploads:
 
-- `knowledge/01-phone-ai-agent-overview.md`
-- `knowledge/02-phone-ai-agent-operating-rules.md`
-- `knowledge/03-phone-ai-agent-endpoints-reference.md`
-- `knowledge/04-phone-ai-agent-environment-expansion.md`
-
-Recommended Instructions seed:
-
-- `knowledge/05-custom-gpt-instructions-template.md`
+- `knowledge/01-phone-ai-agent-system-overview.md`
+- `knowledge/02-phone-ai-agent-capabilities-and-access.md`
+- `knowledge/03-phone-ai-agent-operating-rules.md`
+- `knowledge/04-phone-ai-agent-endpoints-reference.md`
+- `knowledge/05-phone-ai-agent-failure-and-recovery.md`
+- `knowledge/06-phone-ai-agent-task-playbooks.md`
 
 ### GitHub-backed Access Modes
 

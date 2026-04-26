@@ -16,6 +16,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
@@ -50,6 +51,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -376,7 +378,7 @@ public class AutomationLoopService extends Service {
                     publicProbeDetail = e.getClass().getSimpleName() + ": " + e.getMessage();
                     localStatus = "Offline";
                 } finally {
-                    if (AutomationSettings.isGitHubRelayMode(AutomationLoopService.this)) {
+                    if (GitHubRelaySync.hasLocalRelayConfig(AutomationLoopService.this)) {
                         try {
                             JSONObject relayState = GitHubRelaySync.buildDeviceState(
                                     AutomationLoopService.this,
@@ -1475,24 +1477,29 @@ public class AutomationLoopService extends Service {
         final Exception[] error = new Exception[1];
         final JSONObject result = new JSONObject();
         final CountDownLatch latch = new CountDownLatch(1);
+        final String[] resolvedPackageName = new String[1];
+        final String[] resolvedAppName = new String[1];
         handler.post(new Runnable() {
             @Override
             public void run() {
                 try {
                     String packageName = payload.optString("package_name", "").trim();
-                    if (packageName.isEmpty()) {
-                        throw new IllegalArgumentException("package_name is required");
-                    }
                     PackageManager packageManager = getPackageManager();
+                    String appName = payload.optString("app_name", "").trim();
+                    if (packageName.isEmpty()) {
+                        packageName = resolveLaunchablePackageName(packageManager, appName);
+                    }
+                    if (packageName.isEmpty()) {
+                        throw new IllegalArgumentException("package_name or resolvable app_name is required");
+                    }
                     Intent intent = packageManager.getLaunchIntentForPackage(packageName);
                     if (intent == null) {
                         throw new IllegalStateException("No launch intent for package: " + packageName);
                     }
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
                     startActivity(intent);
-                    result.put("package_name", packageName);
-                    result.put("launched", true);
-                    result.put("executed_by", "phone_ai_control_service");
+                    resolvedPackageName[0] = packageName;
+                    resolvedAppName[0] = appName;
                 } catch (Exception e) {
                     error[0] = e;
                 } finally {
@@ -1504,7 +1511,152 @@ public class AutomationLoopService extends Service {
         if (error[0] != null) {
             throw error[0];
         }
+        String packageName = resolvedPackageName[0] == null ? "" : resolvedPackageName[0];
+        String appName = resolvedAppName[0] == null ? "" : resolvedAppName[0];
+        boolean foregroundVerified = waitForForegroundPackage(packageName, 5000L);
+        if (!foregroundVerified) {
+            postLaunchFallbackNotification(packageName, appName);
+            throw new IllegalStateException("Android blocked or did not confirm the background app launch. A tap-to-open notification was posted.");
+        }
+        result.put("package_name", packageName);
+        if (!appName.isEmpty()) {
+            result.put("app_name", appName);
+        }
+        result.put("launched", true);
+        result.put("foreground_verified", true);
+        result.put("executed_by", "phone_ai_control_service");
         return result;
+    }
+
+    private boolean waitForForegroundPackage(String expectedPackageName, long timeoutMs) {
+        if (expectedPackageName == null || expectedPackageName.trim().isEmpty()) {
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + Math.max(timeoutMs, 1000L);
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                String current = getLatestForegroundPackage();
+                if (expectedPackageName.equals(current)) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+            }
+            try {
+                Thread.sleep(350L);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private String getLatestForegroundPackage() {
+        if (!hasUsageAccess() || Build.VERSION.SDK_INT < 21) {
+            return "";
+        }
+        UsageStatsManager usageStatsManager = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+        if (usageStatsManager == null) {
+            return "";
+        }
+        long end = System.currentTimeMillis();
+        long start = end - 15_000L;
+        UsageEvents events = usageStatsManager.queryEvents(start, end);
+        UsageEvents.Event event = new UsageEvents.Event();
+        String foregroundPackage = "";
+        while (events != null && events.hasNextEvent()) {
+            events.getNextEvent(event);
+            int type = event.getEventType();
+            boolean isForeground = type == UsageEvents.Event.MOVE_TO_FOREGROUND
+                    || (Build.VERSION.SDK_INT >= 29 && type == UsageEvents.Event.ACTIVITY_RESUMED);
+            if (!isForeground) {
+                continue;
+            }
+            String packageName = event.getPackageName();
+            if (packageName != null && !packageName.isEmpty()) {
+                foregroundPackage = packageName;
+            }
+        }
+        return foregroundPackage;
+    }
+
+    private void postLaunchFallbackNotification(String packageName, String appName) {
+        try {
+            PackageManager packageManager = getPackageManager();
+            Intent intent = packageManager.getLaunchIntentForPackage(packageName);
+            if (intent == null) {
+                return;
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+            int notificationId = Math.abs((packageName + ":launch").hashCode());
+            PendingIntent pendingIntent = PendingIntent.getActivity(
+                    this,
+                    notificationId,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0)
+            );
+            String displayName = !appName.trim().isEmpty() ? appName.trim() : packageName;
+            Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            builder.setContentTitle("Tap to open " + displayName)
+                    .setContentText("Android blocked the background launch. Tap here to open it.")
+                    .setStyle(new Notification.BigTextStyle().bigText("Android blocked the background launch for " + displayName + ". Tap this notification to open it manually."))
+                    .setSmallIcon(android.R.drawable.stat_notify_more)
+                    .setContentIntent(pendingIntent)
+                    .setAutoCancel(true)
+                    .setWhen(System.currentTimeMillis())
+                    .setShowWhen(true)
+                    .setDefaults(Notification.DEFAULT_ALL)
+                    .setPriority(Notification.PRIORITY_HIGH);
+            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.notify("launch-fallback", notificationId, builder.build());
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private String resolveLaunchablePackageName(PackageManager packageManager, String appName) {
+        if (appName == null || appName.trim().isEmpty()) {
+            return "";
+        }
+        String query = appName.trim().toLowerCase(Locale.US);
+        String containsMatch = "";
+        String packageContainsMatch = "";
+        try {
+            List<PackageInfo> packages = packageManager.getInstalledPackages(0);
+            for (PackageInfo info : packages) {
+                if (info == null || info.packageName == null || info.applicationInfo == null) {
+                    continue;
+                }
+                String packageName = info.packageName;
+                if (packageManager.getLaunchIntentForPackage(packageName) == null) {
+                    continue;
+                }
+                CharSequence labelSeq = packageManager.getApplicationLabel(info.applicationInfo);
+                String label = labelSeq == null ? "" : labelSeq.toString().trim();
+                String lowerLabel = label.toLowerCase(Locale.US);
+                String lowerPackage = packageName.toLowerCase(Locale.US);
+                if (lowerLabel.equals(query) || lowerPackage.equals(query)) {
+                    return packageName;
+                }
+                if (lowerLabel.startsWith(query)) {
+                    return packageName;
+                }
+                if (containsMatch.isEmpty() && lowerLabel.contains(query)) {
+                    containsMatch = packageName;
+                }
+                if (packageContainsMatch.isEmpty() && lowerPackage.contains(query)) {
+                    packageContainsMatch = packageName;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        if (!containsMatch.isEmpty()) {
+            return containsMatch;
+        }
+        return packageContainsMatch;
     }
 
     private JSONObject executeClearNotificationsAction(final JSONObject payload) throws Exception {

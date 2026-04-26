@@ -41,9 +41,10 @@ final class GitHubRelaySync {
     private static final String DEFAULT_API_BASE = "https://api.github.com";
     private static final String DEFAULT_LOCAL_API = "http://127.0.0.1:8787";
     private static final String DEFAULT_BRANCH = "main";
-    private static final String DEFAULT_RELAY_REPO = "phone-ai-relay-private";
+    private static final String DEFAULT_RELAY_REPO = "phone-ai-relay";
     private static final String DEFAULT_CONTENTS_PATH = "relay/current_device.json";
     private static final String DEFAULT_DEVICE_NAME = "Android Phone";
+    private static final String DEFAULT_PUBLIC_RELAY_SCHEMA_URL = "";
     private static final String BOOTSTRAP_WORKFLOW_PATH = ".github/workflows/phone-api-github-relay.yml";
     private static final String BOOTSTRAP_SCRIPT_PATH = "relay/github_issue_relay.py";
     private static final String BOOTSTRAP_ISSUE_TEMPLATE_PATH = ".github/ISSUE_TEMPLATE/phone-relay.md";
@@ -93,6 +94,52 @@ final class GitHubRelaySync {
         return normalizePublicUrl(config.optString("bridge_base_url", ""));
     }
 
+    static synchronized String getRelaySchemaUrl(Context context) {
+        JSONObject config = loadConfig(context);
+        if (config != null) {
+            String configured = normalizePublicUrl(config.optString("relay_schema_url", ""));
+            if (!configured.isEmpty()) {
+                return configured;
+            }
+        }
+        return DEFAULT_PUBLIC_RELAY_SCHEMA_URL;
+    }
+
+    static synchronized String getConfiguredOwnerRepo(Context context) {
+        JSONObject config = loadConfig(context);
+        if (config == null) {
+            return "";
+        }
+        String owner = config.optString("owner", "").trim();
+        String repo = config.optString("repo", "").trim();
+        if (owner.isEmpty() || repo.isEmpty()) {
+            return "";
+        }
+        return owner + "/" + repo;
+    }
+
+    static String buildSchemaUrl(String baseUrl) {
+        String normalized = normalizePublicUrl(baseUrl);
+        if (normalized.isEmpty()) {
+            return "";
+        }
+        if (normalized.endsWith("/openapi.json")) {
+            return normalized;
+        }
+        return normalized + "/openapi.json";
+    }
+
+    static String buildGptSchemaUrl(String baseUrl) {
+        String normalized = normalizePublicUrl(baseUrl);
+        if (normalized.isEmpty()) {
+            return "";
+        }
+        if (normalized.endsWith("/openapi-gpt.json")) {
+            return normalized;
+        }
+        return normalized + "/openapi-gpt.json";
+    }
+
     static synchronized String getPreferredAccessUrl(Context context, String currentPhonePublicUrl) {
         String bridge = getBridgeBaseUrl(context);
         if (!bridge.isEmpty()) {
@@ -102,7 +149,7 @@ final class GitHubRelaySync {
         if (!normalizedPhone.isEmpty()) {
             return normalizedPhone;
         }
-        return getConfiguredRepoUrl(context);
+        return "";
     }
 
     static synchronized String loadGitHubTokenForCopy(Context context) {
@@ -258,7 +305,10 @@ final class GitHubRelaySync {
             return writeState(context, state);
         } catch (Exception e) {
             logError("GitHub relay bootstrap failed.", e);
-            JSONObject failed = buildUnconfiguredState(context, "GitHub bootstrap failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            JSONObject existingConfig = loadConfig(context);
+            JSONObject failed = existingConfig != null
+                    ? buildInvalidConfigState(context, existingConfig, "GitHub bootstrap failed: " + e.getClass().getSimpleName() + ": " + e.getMessage())
+                    : buildUnconfiguredState(context, "GitHub bootstrap failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             putSafe(failed, "last_ok", false);
             return writeState(context, failed);
         }
@@ -489,12 +539,44 @@ final class GitHubRelaySync {
             putSafe(payload, "device_name", config.optString("device_name", ""));
         }
 
+        String payloadJson = payload.toString();
+        String payloadBase64 = Base64.encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         String semanticHash = computeSemanticHash(payload);
         long lastAttempt = state == null ? 0L : state.optLong("last_attempt_epoch_ms", 0L);
         long lastSuccess = state == null ? 0L : state.optLong("last_success_epoch_ms", 0L);
         String lastHash = state == null ? "" : state.optString("last_payload_hash", "");
+        String currentPublicUrl = emptyToNull(payload.optString("public_url", ""));
+        boolean currentLocalApiOk = payload.optBoolean("local_api_ok", false);
+        boolean currentHealthy = payload.optBoolean("healthy", false);
+        String previousPublicUrl = state == null ? null : emptyToNull(state.optString("last_synced_public_url", ""));
+        boolean previousLocalApiOk = state != null && state.optBoolean("last_synced_local_api_ok", false);
+        boolean previousHealthy = state != null && state.optBoolean("last_synced_healthy", false);
+        boolean recoveredImportantState =
+                (currentPublicUrl != null && previousPublicUrl == null)
+                        || (currentLocalApiOk && !previousLocalApiOk)
+                        || (currentHealthy && !previousHealthy);
+        SyncTarget preflightTarget = null;
+        HttpResult preflightExisting = null;
+        String existingBase64 = "";
+        String existingSha = "";
+        boolean remoteNeedsCorrection = false;
+        try {
+            preflightTarget = resolveTarget(config);
+            preflightExisting = getExistingContents(preflightTarget, token);
+            if (preflightExisting.statusCode == 200 && preflightExisting.body != null && !preflightExisting.body.isEmpty()) {
+                JSONObject existingJson = new JSONObject(preflightExisting.body);
+                existingSha = existingJson.optString("sha", "").trim();
+                existingBase64 = existingJson.optString("content", "").replace("\n", "").replace("\r", "").trim();
+                remoteNeedsCorrection = !payloadBase64.equals(existingBase64);
+            } else {
+                remoteNeedsCorrection = true;
+            }
+        } catch (Exception e) {
+            logInfo("GitHub relay preflight compare failed, forcing corrective sync: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            remoteNeedsCorrection = true;
+        }
         if (!force) {
-            if (now - lastAttempt < MIN_ATTEMPT_INTERVAL_MS) {
+            if (!recoveredImportantState && !remoteNeedsCorrection && now - lastAttempt < MIN_ATTEMPT_INTERVAL_MS) {
                 JSONObject skipped = mergeBaseState(context, state, config);
                 putSafe(skipped, "last_ok", skipped.optBoolean("last_ok", false));
                 putSafe(skipped, "last_message", "Skipped GitHub relay sync due to cooldown.");
@@ -503,7 +585,7 @@ final class GitHubRelaySync {
                 logInfo("Skipped GitHub relay sync because of cooldown.");
                 return writeState(context, skipped);
             }
-            if (semanticHash.equals(lastHash) && now - lastSuccess < HEARTBEAT_INTERVAL_MS) {
+            if (!recoveredImportantState && !remoteNeedsCorrection && semanticHash.equals(lastHash) && now - lastSuccess < HEARTBEAT_INTERVAL_MS) {
                 JSONObject skipped = mergeBaseState(context, state, config);
                 putSafe(skipped, "last_ok", true);
                 putSafe(skipped, "last_message", "GitHub relay already has the latest device state.");
@@ -523,17 +605,13 @@ final class GitHubRelaySync {
         writeState(context, inProgress);
 
         try {
-            SyncTarget target = resolveTarget(config);
+            SyncTarget target = preflightTarget != null ? preflightTarget : resolveTarget(config);
             RepoResult repoResult = ensureRepositoryExists(config, token, true);
             putSafe(inProgress, "repo_exists", repoResult.exists);
             putSafe(inProgress, "repo_created", repoResult.created);
             putSafe(inProgress, "repo_url", emptyToNull(repoResult.repoHtmlUrl));
-            HttpResult existing = getExistingContents(target, token);
-            String payloadJson = payload.toString(2);
-            String payloadBase64 = Base64.encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
-            String existingBase64 = "";
-            String existingSha = "";
-            if (existing.statusCode == 200 && existing.body != null && !existing.body.isEmpty()) {
+            HttpResult existing = preflightExisting != null ? preflightExisting : getExistingContents(target, token);
+            if (preflightExisting == null && existing.statusCode == 200 && existing.body != null && !existing.body.isEmpty()) {
                 JSONObject existingJson = new JSONObject(existing.body);
                 existingSha = existingJson.optString("sha", "").trim();
                 existingBase64 = existingJson.optString("content", "").replace("\n", "").replace("\r", "").trim();
@@ -545,6 +623,9 @@ final class GitHubRelaySync {
                 putSafe(upToDate, "last_success_epoch_ms", now);
                 putSafe(upToDate, "last_http_status", 200);
                 putSafe(upToDate, "last_payload_hash", semanticHash);
+                putSafe(upToDate, "last_synced_public_url", currentPublicUrl);
+                putSafe(upToDate, "last_synced_local_api_ok", currentLocalApiOk);
+                putSafe(upToDate, "last_synced_healthy", currentHealthy);
                 putSafe(upToDate, "skipped", true);
                 logInfo("GitHub relay target already contained the latest payload.");
                 return writeState(context, upToDate);
@@ -569,6 +650,9 @@ final class GitHubRelaySync {
             putSafe(success, "last_success_epoch_ms", now);
             putSafe(success, "last_http_status", putResult.statusCode);
             putSafe(success, "last_payload_hash", semanticHash);
+            putSafe(success, "last_synced_public_url", currentPublicUrl);
+            putSafe(success, "last_synced_local_api_ok", currentLocalApiOk);
+            putSafe(success, "last_synced_healthy", currentHealthy);
             putSafe(success, "skipped", false);
             try {
                 JSONObject body = new JSONObject(putResult.body);
